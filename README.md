@@ -12,6 +12,7 @@ Gentoo (Asahi Linux, Apple Silicon MacBook).
 | [dockapps](dockapps) | A clock and a battery monitor for the Dock, wmclock and wmacpi, drawn at the GUI scale factor: as large as the tile, where the upstream ones are a small picture in the middle of it |
 | [ledclock](ledclock) | A clock on the desktop: the time in red seven-segment digits on a dark display panel in a metal frame, with the charge of the battery, under the other windows, as sharp at the GUI scale factor as at 1. Dragged to its place, and by a corner to its size |
 | [kernel](kernel) | Asahi kernel patches: the panel backlight in 1/64 nit and up to 60 updates a second, so brightness changes have no visible steps; the PMP on for lower idle power; ProMotion VRR; the full panel height around the notch; a smaller kernel config, without the drivers this MacBook cannot use, that builds 2156 modules instead of 4946 |
+| [ecores](ecores) | Keeps background work on the efficiency cores: the system's daemons always, and batch work such as emerge's builds while the machine runs from its battery |
 | [audio](audio) | Puts the sound system ahead of everything else on the CPU: PipeWire and asahi-audio's speaker DSP run in real time, above every other program and interrupt thread |
 | [network](network) | Keeps the machine from being found or reached on the networks it joins: a firewall that lets in nothing unasked and does not answer ping, and no hostname or real MAC address given to the network |
 | [nsrun](nsrun) | Runs a program in Linux namespaces of its own, with a home of its own, so that it cannot read or change the rest of the system; with XLibre's Xnamespace extension its windows can be cut off from the others too |
@@ -25,8 +26,9 @@ builds the latest commit here and installs all the tools: `mediakeyd`,
 apps `wmclock`, `wmacpi` and `wmacpi-cli` in `/usr/bin`, autobrightd's udev
 rule in `/usr/lib/udev/rules.d`, the dock apps' man pages, and the READMEs.
 The kernel patches and config,
-the audio priorities, the firewall and network settings and SELinux are
-separate (see [kernel](kernel), [audio](audio), [network](network) and
+the cgroups for the efficiency cores, the audio priorities, the firewall
+and network settings and SELinux are separate (see [kernel](kernel),
+[ecores](ecores), [audio](audio), [network](network) and
 [selinux](selinux)).
 
 ```sh

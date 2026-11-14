@@ -1,0 +1,11 @@
+#!/bin/sh
+# wmutils: installed as /etc/local.d/wmutils-ecores.start
+# by ecores/install.sh. s6-rc's init-local (OpenRC's local service does the
+# same) runs it at every boot; install.sh runs it once so that nothing waits
+# for a reboot. Running it again is harmless.
+#
+# Moves the system's daemons, all started by now or about to be started by
+# a supervisor that is, into a cgroup that keeps them on the efficiency
+# cores, and makes the cgroup for batch work. See ecores/README.md.
+
+exec /usr/local/share/wmutils/ecores/ecores.sh start
