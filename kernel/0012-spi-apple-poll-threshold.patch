@@ -1,0 +1,69 @@
+From: kkw537 <171009921+kkw537@users.noreply.github.com>
+Subject: [PATCH] spi: apple: the polling threshold as a parameter
+
+The driver polls for the FIFO when half a FIFO takes at most 5 us on
+the wire, and otherwise sleeps until the interrupt. The keyboard and
+trackpad of a MacBook are read at 8 MHz, where half a FIFO takes 8 us:
+just above. A packet of theirs is 256 bytes and the FIFO holds 16, so
+one packet is read in about sixteen pieces, each with an interrupt and
+with the reading thread put to sleep and woken again for a wait of a
+few microseconds.
+
+With a finger on the trackpad that was measured on a MacBook Pro
+14-inch (M1 Pro) as 1000 interrupts and 1250 wakeups of the thread a
+second, for 63 packets. In that minute more than half of the
+interrupts were delivered to a performance core, and AIC2 has no
+affinity setting that would keep them from one.
+
+This makes the 5 us a module parameter, poll_us, which can be changed
+while the driver is in use. At its default nothing changes. With
+poll_us=8 the keyboard and trackpad are polled: the 256 us a packet is
+on the wire, in place of the interrupts.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+--- a/drivers/spi/spi-apple.c
++++ b/drivers/spi/spi-apple.c
+@@ -16,6 +16,7 @@
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/spi/spi.h>
++#include <linux/time.h>
+ 
+ #define APPLE_SPI_CTRL			0x000
+ #define APPLE_SPI_CTRL_RUN		BIT(0)
+@@ -120,6 +121,15 @@
+  */
+ #define APPLE_SPI_TIMEOUT_MS		200
+ 
++/*
++ * A wait for the FIFO of at most this many microseconds is polled, a
++ * longer one is slept through until the interrupt.
++ */
++static unsigned int poll_us = 5;
++module_param(poll_us, uint, 0644);
++MODULE_PARM_DESC(poll_us,
++		 "Poll for the FIFO when the wait is at most this many microseconds (5)");
++
+ struct apple_spi {
+ 	void __iomem      *regs;        /* MMIO register address */
+ 	struct clk        *clk;         /* bus clock */
+@@ -207,12 +217,14 @@
+ 
+ 	/* We will want to poll if the time we need to wait is
+ 	 * less than the context switching time.
+-	 * Let's call that threshold 5us. The operation will take:
+-	 *    bits_per_word * fifo_threshold / hz <= 5 * 10^-6
+-	 *    200000 * bits_per_word * fifo_threshold <= hz
++	 * Let's call that threshold 5us, unless poll_us says otherwise.
++	 * The operation will take:
++	 *    bits_per_word * fifo_threshold / hz <= poll_us * 10^-6
++	 *    10^6 * bits_per_word * fifo_threshold <= poll_us * hz
+ 	 */
+ 	fifo_threshold = APPLE_SPI_FIFO_DEPTH / 2;
+-	return (200000 * t->bits_per_word * fifo_threshold) <= t->speed_hz;
++	return (u64)USEC_PER_SEC * t->bits_per_word * fifo_threshold <=
++	       (u64)READ_ONCE(poll_us) * t->speed_hz;
+ }
+ 
+ static irqreturn_t apple_spi_irq(int irq, void *dev_id)

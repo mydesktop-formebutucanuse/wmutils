@@ -1,0 +1,111 @@
+From: kkw537 <171009921+kkw537@users.noreply.github.com>
+Subject: [PATCH] cpuidle: apple: power a core down for idle periods from 2 ms
+
+The driver's deep state ("CPU PD", deep WFI) has an exit latency of
+10 us but asked for 10 ms of idle time before it is worth entering. The
+governor therefore leaves a core in plain WFI, clock-gated but powered,
+whenever the next timer or the idle time it predicts is under 10 ms: a
+core that a 120 Hz display (8.3 ms) or a short audio period wakes never
+powers down at all. On an M1 Pro, over three hours that included a long
+compile, the first efficiency core spent more time in WFI (5377 s) than
+powered down (3836 s), and more than half of its deep-state entries were
+ended early by a wakeup the governor had not expected so soon.
+
+Entering the state costs cpu_pm_enter() and cpu_pm_exit() and saving a
+few registers; nothing is reset and the core resumes in line. So ask for
+2 ms instead. Where the state really breaks even has not been measured,
+and a value that is too low costs energy instead of saving it, so make
+it a parameter that can be changed while running:
+
+  /sys/module/cpuidle_apple/parameters/pd_residency_us
+
+or cpuidle_apple.pd_residency_us= at boot. 10000 gives the old
+behaviour back. The governors read the state's target residency each
+time they choose a state, so a new value applies from the next idle
+period on.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+--- a/drivers/cpuidle/cpuidle-apple.c
++++ b/drivers/cpuidle/cpuidle-apple.c
+@@ -8,6 +8,8 @@
+ #include <linux/init.h>
+ #include <linux/cpuidle.h>
+ #include <linux/cpu_pm.h>
++#include <linux/kstrtox.h>
++#include <linux/moduleparam.h>
+ #include <linux/platform_device.h>
+ #include <linux/of.h>
+ #include <asm/cpuidle.h>
+@@ -18,6 +20,22 @@
+ 	STATE_COUNT
+ };
+ 
++/*
++ * The shortest idle period, in microseconds, for which a core is powered
++ * down instead of clock-gated. Deep WFI is left within microseconds, and
++ * entering it costs cpu_pm_enter() and cpu_pm_exit(), so it pays off long
++ * before the 10 ms this driver used to ask for. That kept a core that
++ * something wakes more than 100 times a second (a 120 Hz display, a short
++ * audio period) out of the state altogether. Where it breaks even has not
++ * been measured, so the value can be changed while running, in
++ * /sys/module/cpuidle_apple/parameters/pd_residency_us, or at boot with
++ * cpuidle_apple.pd_residency_us=. 10000 gives the old behaviour.
++ */
++#define PD_RESIDENCY_US_DEFAULT	2000
++#define PD_RESIDENCY_US_MAX	1000000
++
++static unsigned int pd_residency_us = PD_RESIDENCY_US_DEFAULT;
++
+ asm(
+ 	".pushsection .cpuidle.text, \"ax\"\n"
+ 	".type apple_cpu_deep_wfi, @function\n"
+@@ -111,7 +129,7 @@
+ 			.enter			= apple_enter_idle,
+ 			.enter_s2idle		= apple_enter_idle,
+ 			.exit_latency		= 10,
+-			.target_residency	= 10000,
++			.target_residency	= PD_RESIDENCY_US_DEFAULT,
+ 			.power_usage            = 0,
+ 			.name			= "CPU PD",
+ 			.desc			= "CPU/cluster powered down",
+@@ -122,6 +140,39 @@
+ 	.state_count = STATE_COUNT,
+ };
+ 
++static int pd_residency_set(const char *val, const struct kernel_param *kp)
++{
++	struct cpuidle_state *s = &apple_idle_driver.states[STATE_PWRDOWN];
++	unsigned int us;
++	int ret;
++
++	ret = kstrtouint(val, 0, &us);
++	if (ret)
++		return ret;
++	/* Longer than WFI's, so that the states stay in order. */
++	if (us < 2 || us > PD_RESIDENCY_US_MAX)
++		return -EINVAL;
++
++	pd_residency_us = us;
++	/*
++	 * The governors read these without a lock, each time they choose a
++	 * state: one more choice by the old value does no harm. Before the
++	 * driver is registered, registering it works out the nanoseconds.
++	 */
++	WRITE_ONCE(s->target_residency, us);
++	WRITE_ONCE(s->target_residency_ns, (s64)us * NSEC_PER_USEC);
++
++	return 0;
++}
++
++static const struct kernel_param_ops pd_residency_ops = {
++	.set = pd_residency_set,
++	.get = param_get_uint,
++};
++module_param_cb(pd_residency_us, &pd_residency_ops, &pd_residency_us, 0644);
++MODULE_PARM_DESC(pd_residency_us,
++		 "Shortest idle period (us) for which a core is powered down");
++
+ static int apple_cpuidle_probe(struct platform_device *pdev)
+ {
+ 	return cpuidle_register(&apple_idle_driver, NULL);

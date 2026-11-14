@@ -1,0 +1,302 @@
+From: kkw537 <171009921+kkw537@users.noreply.github.com>
+Subject: [PATCH] i2c: pasemi: apple: runtime PM between transfers
+
+The Apple I2C controller (i2c-apple) has no runtime PM, and the power
+domain framework counts a device without it as in use. So the power
+domain of every I2C bus (ps_i2cN) is on for as long as the machine is
+up, although the controller does nothing between transfers, and on a
+MacBook that is nearly always: its buses carry the USB-C port
+controllers and the audio codecs, which are written to when a cable
+goes in or a stream starts. The same domains are already switched off
+and on by every suspend to idle.
+
+With this the controller is awake for the length of a transfer and
+100 ms after it, so that a burst of them wakes it once. The transfer
+functions of the core take the reference, which changes nothing for
+the PCI variant: its device has runtime PM forbidden and is active
+throughout. Resume sets the controller up again the way probe does, in
+case the domain did not keep the registers. Outside a transfer no
+interrupt is enabled, so none arrives while the controller is without
+power.
+
+For a system sleep the controller is woken in its suspend callback and
+kept awake until its last one, where pm_runtime_force_suspend() takes
+over, and pm_runtime_force_resume() sets it up again first thing on
+the way back. The devices on the bus can so be talked to in all of
+their own callbacks, also those that run while runtime PM is off and a
+sleeping controller could not be woken.
+
+As with the USB-C ports, runtime PM is forbidden until user space
+writes "auto" to power/control, so that without that the controller
+stays powered as before:
+
+  /sys/bus/platform/devices/39b040000.i2c/power/control
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+--- a/drivers/i2c/busses/i2c-pasemi-core.c
++++ b/drivers/i2c/busses/i2c-pasemi-core.c
+@@ -13,6 +13,7 @@
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/pci.h>
++#include <linux/pm_runtime.h>
+ #include <linux/sched.h>
+ #include <linux/slab.h>
+ #include <linux/stddef.h>
+@@ -238,8 +239,8 @@
+ 	return err;
+ }
+ 
+-static int pasemi_i2c_xfer(struct i2c_adapter *adapter,
+-			   struct i2c_msg *msgs, int num)
++static int pasemi_i2c_do_xfer(struct i2c_adapter *adapter,
++			      struct i2c_msg *msgs, int num)
+ {
+ 	struct pasemi_smbus *smbus = adapter->algo_data;
+ 	int ret, i;
+@@ -254,7 +255,7 @@
+ 	return ret ? ret : num;
+ }
+ 
+-static int pasemi_smb_xfer(struct i2c_adapter *adapter,
++static int pasemi_smb_do_xfer(struct i2c_adapter *adapter,
+ 		u16 addr, unsigned short flags, char read_write, u8 command,
+ 		int size, union i2c_smbus_data *data)
+ {
+@@ -406,6 +407,50 @@
+ 	return err;
+ }
+ 
++/*
++ * The controller is awake for the length of a transfer. Where the bus
++ * driver has runtime PM for it, it may sleep between them; where it has
++ * none, as on PCI, the device is active throughout and this changes
++ * nothing. A transfer to a controller that is asleep while runtime PM is
++ * off, as it is late in a system sleep, fails here and does not reach
++ * the registers of a controller without power.
++ */
++static int pasemi_i2c_xfer(struct i2c_adapter *adapter,
++			   struct i2c_msg *msgs, int num)
++{
++	struct pasemi_smbus *smbus = adapter->algo_data;
++	int ret;
++
++	ret = pm_runtime_resume_and_get(smbus->dev);
++	if (ret < 0)
++		return ret;
++
++	ret = pasemi_i2c_do_xfer(adapter, msgs, num);
++
++	pm_runtime_put_autosuspend(smbus->dev);
++
++	return ret;
++}
++
++static int pasemi_smb_xfer(struct i2c_adapter *adapter,
++		u16 addr, unsigned short flags, char read_write, u8 command,
++		int size, union i2c_smbus_data *data)
++{
++	struct pasemi_smbus *smbus = adapter->algo_data;
++	int ret;
++
++	ret = pm_runtime_resume_and_get(smbus->dev);
++	if (ret < 0)
++		return ret;
++
++	ret = pasemi_smb_do_xfer(adapter, addr, flags, read_write, command,
++				 size, data);
++
++	pm_runtime_put_autosuspend(smbus->dev);
++
++	return ret;
++}
++
+ static u32 pasemi_smb_func(struct i2c_adapter *adapter)
+ {
+ 	return I2C_FUNC_SMBUS_QUICK | I2C_FUNC_SMBUS_BYTE |
+@@ -420,6 +465,19 @@
+ 	.functionality = pasemi_smb_func,
+ };
+ 
++/*
++ * Brings the controller to the state transfers start from: no interrupt
++ * enabled, the FIFOs empty, the clock divider set. For probe, and for a
++ * controller that has been without power.
++ */
++void pasemi_i2c_common_init(struct pasemi_smbus *smbus)
++{
++	reg_write(smbus, REG_IMASK, 0);
++
++	pasemi_reset(smbus);
++}
++EXPORT_SYMBOL_GPL(pasemi_i2c_common_init);
++
+ int pasemi_i2c_common_probe(struct pasemi_smbus *smbus)
+ {
+ 	int error;
+@@ -438,9 +496,7 @@
+ 	if (smbus->hw_rev != PASEMI_HW_REV_PCI)
+ 		smbus->hw_rev = reg_read(smbus, REG_REV);
+ 
+-	reg_write(smbus, REG_IMASK, 0);
+-
+-	pasemi_reset(smbus);
++	pasemi_i2c_common_init(smbus);
+ 
+ 	error = devm_i2c_add_adapter(smbus->dev, &smbus->adapter);
+ 	if (error)
+--- a/drivers/i2c/busses/i2c-pasemi-core.h
++++ b/drivers/i2c/busses/i2c-pasemi-core.h
+@@ -22,5 +22,6 @@
+ };
+ 
+ int pasemi_i2c_common_probe(struct pasemi_smbus *smbus);
++void pasemi_i2c_common_init(struct pasemi_smbus *smbus);
+ 
+ irqreturn_t pasemi_irq_handler(int irq, void *dev_id);
+--- a/drivers/i2c/busses/i2c-pasemi-platform.c
++++ b/drivers/i2c/busses/i2c-pasemi-platform.c
+@@ -11,10 +11,18 @@
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
+ #include <linux/types.h>
+ 
+ #include "i2c-pasemi-core.h"
+ 
++/*
++ * How long after a transfer the controller stays awake, in ms: the next
++ * one of a burst, such as a codec's registers at the start of a stream,
++ * finds it so.
++ */
++#define PASEMI_PLATFORM_AUTOSUSPEND_MS	100
++
+ struct pasemi_platform_i2c_data {
+ 	struct pasemi_smbus smbus;
+ 	struct clk *clk_ref;
+@@ -42,6 +50,14 @@
+ 	return 0;
+ }
+ 
++static void pasemi_platform_i2c_rpm_release(void *data)
++{
++	struct device *dev = data;
++
++	pm_runtime_allow(dev);
++	pm_runtime_dont_use_autosuspend(dev);
++}
++
+ static int pasemi_platform_i2c_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -74,23 +90,98 @@
+ 	if (error)
+ 		return error;
+ 
++	platform_set_drvdata(pdev, data);
++
++	/*
++	 * Runtime PM before the adapter: the devices on the bus are probed,
++	 * and talked to, as soon as it is registered. The controller has
++	 * power now, and keeps it until user space writes "auto" to
++	 * power/control: with that it sleeps between transfers, and its
++	 * power domain is switched off.
++	 */
++	pm_runtime_get_noresume(dev);
++	pm_runtime_set_autosuspend_delay(dev, PASEMI_PLATFORM_AUTOSUSPEND_MS);
++	pm_runtime_use_autosuspend(dev);
++	pm_runtime_set_active(dev);
++	pm_runtime_forbid(dev);
++	error = devm_add_action_or_reset(dev, pasemi_platform_i2c_rpm_release,
++					 dev);
++	if (!error)
++		error = devm_pm_runtime_enable(dev);
++	if (error) {
++		pm_runtime_put_noidle(dev);
++		return error;
++	}
++
+ 	smbus->adapter.dev.of_node = pdev->dev.of_node;
+ 	error = pasemi_i2c_common_probe(smbus);
+-	if (error)
++	if (error) {
++		pm_runtime_put_noidle(dev);
+ 		return error;
++	}
+ 
+ 	irq_num = platform_get_irq(pdev, 0);
+ 	error = devm_request_irq(smbus->dev, irq_num, pasemi_irq_handler, 0, "pasemi_apple_i2c", (void *)smbus);
+ 
+ 	if (!error)
+ 		smbus->use_irq = 1;
+-	platform_set_drvdata(pdev, data);
++
++	pm_runtime_put_autosuspend(dev);
+ 
+ 	return 0;
+ }
+ 
+ static void pasemi_platform_i2c_remove(struct platform_device *pdev) { }
+ 
++/*
++ * Nothing to do before the power domain is switched off: no transfer is
++ * under way, and no interrupt is enabled outside one.
++ */
++static int pasemi_platform_i2c_runtime_suspend(struct device *dev)
++{
++	return 0;
++}
++
++/* The power domain is back on, and the registers may have been lost. */
++static int pasemi_platform_i2c_runtime_resume(struct device *dev)
++{
++	struct pasemi_platform_i2c_data *data = dev_get_drvdata(dev);
++
++	pasemi_i2c_common_init(&data->smbus);
++
++	return 0;
++}
++
++/*
++ * The devices on the bus may be talked to until their last callback of a
++ * system sleep and from their first one after it, at times when runtime
++ * PM is off and a controller that is asleep cannot be woken. So it is
++ * woken here, while that still works, and stays awake until its own last
++ * callback, pm_runtime_force_suspend(). pm_runtime_force_resume() sets it
++ * up again before any of those devices is resumed, and it may sleep
++ * again from pasemi_platform_i2c_resume() on.
++ */
++static int pasemi_platform_i2c_suspend(struct device *dev)
++{
++	return pm_runtime_resume_and_get(dev);
++}
++
++static int pasemi_platform_i2c_resume(struct device *dev)
++{
++	pm_runtime_put_autosuspend(dev);
++
++	return 0;
++}
++
++static const struct dev_pm_ops pasemi_platform_i2c_pm_ops = {
++	SYSTEM_SLEEP_PM_OPS(pasemi_platform_i2c_suspend,
++			    pasemi_platform_i2c_resume)
++	NOIRQ_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend,
++				  pm_runtime_force_resume)
++	RUNTIME_PM_OPS(pasemi_platform_i2c_runtime_suspend,
++		       pasemi_platform_i2c_runtime_resume, NULL)
++};
++
+ static const struct of_device_id pasemi_platform_i2c_of_match[] = {
+ 	{ .compatible = "apple,t8103-i2c" },
+ 	{ .compatible = "apple,i2c" },
+@@ -102,6 +193,7 @@
+ 	.driver	= {
+ 		.name			= "i2c-apple",
+ 		.of_match_table		= pasemi_platform_i2c_of_match,
++		.pm			= pm_ptr(&pasemi_platform_i2c_pm_ops),
+ 	},
+ 	.probe	= pasemi_platform_i2c_probe,
+ 	.remove = pasemi_platform_i2c_remove,

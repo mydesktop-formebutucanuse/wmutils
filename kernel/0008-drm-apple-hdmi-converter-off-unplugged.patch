@@ -1,0 +1,298 @@
+From: kkw537 <171009921+kkw537@users.noreply.github.com>
+Subject: [PATCH] drm: apple: DP to HDMI converter off while nothing is plugged
+ in
+
+The HDMI port of the 14 and 16 inch MacBook Pro is a DisplayPort output
+of the SoC behind a DP to HDMI converter. The driver raises both of its
+power GPIOs at probe, hdmi-pwren and dp2hdmi-pwren, and never lowers
+them, with a TODO to check whether one is enough for the HPD interrupt
+"to save power on battery powered Macbooks". So the converter is
+powered for as long as the machine is up, with or without a cable.
+
+With the new parameter hdmi_idle_off, dp2hdmi-pwren is lowered while
+the HPD line is low and nothing uses the port, and raised again when
+the line rises. hdmi-pwren stays up: it is taken to be the 5 V of the
+port, which a display needs to raise HPD at all.
+
+  - Down: three seconds after the HPD line went low (or the CRTC went
+    off, or the driver started with nothing plugged in), if the line is
+    still low and the CRTC is off. The DCP has seen the display go by
+    then; what dcp_poweroff() does for a CRTC switched off with nothing
+    plugged in is done first, so that the DCP's port is released before
+    its converter goes.
+  - Up: in the HPD interrupt, before its 500 ms debounce, and in
+    dcp_dptx_connect() for every other way there. The converter gets
+    hdmi_boot_ms (500) from power to the DCP's connect.
+
+  /sys/module/appledrm/parameters/hdmi_idle_off
+  /sys/module/appledrm/parameters/hdmi_boot_ms
+
+Both can be written at any time; writing 0 to the first powers the
+converter up at once. It is off unless asked for, because the one thing
+it depends on has to be tried on the board: that the HPD line still
+reaches the SoC while the converter is down. If it does not, a display
+plugged in is not noticed until 0 is written.
+
+The DisplayPort PHY behind the converter is left as it was.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+--- a/drivers/gpu/drm/apple/dcp-internal.h
++++ b/drivers/gpu/drm/apple/dcp-internal.h
+@@ -261,6 +261,12 @@
+ 
+ 	struct mutex hpd_mutex;
+ 
++	/* hdmi_idle_off: the converter down while nothing is plugged in */
++	struct delayed_work dp2hdmi_idle_work;
++	ktime_t dp2hdmi_on_at;
++	bool dp2hdmi_off;
++	bool crtc_on;
++
+ 	u32 dptx_phy;
+ 	u32 dptx_die;
+ 	int hdmi_hpd_irq;
+--- a/drivers/gpu/drm/apple/dcp.c
++++ b/drivers/gpu/drm/apple/dcp.c
+@@ -13,6 +13,8 @@
+ #include <linux/jiffies.h>
+ #include <linux/kconfig.h>
+ #include <linux/kernel.h>
++#include <linux/ktime.h>
++#include <linux/minmax.h>
+ #include <linux/module.h>
+ #include <linux/moduleparam.h>
+ #include <linux/of_address.h>
+@@ -363,6 +365,62 @@
+ 	return (dcp->connector_type);
+ }
+ 
++/*
++ * The DP to HDMI converter of the 14 and 16 inch MacBook Pro has been
++ * powered for as long as the driver is bound, with or without a cable in
++ * the HDMI port. With hdmi_idle_off it is powered down while the HPD line
++ * is low and nothing uses the port, and up again when the line rises. The
++ * 5 V of the port, which a display needs to raise that line, stays on.
++ * Off unless asked for: whether the line reaches the SoC with the
++ * converter down has not been measured on every board.
++ */
++static bool hdmi_idle_off;
++
++static unsigned int hdmi_boot_ms = 500;
++module_param(hdmi_boot_ms, uint, 0644);
++MODULE_PARM_DESC(hdmi_boot_ms,
++		 "Time in ms the DP to HDMI converter gets to start after hdmi_idle_off had it powered down");
++
++#define DP2HDMI_IDLE_DELAY	msecs_to_jiffies(3000)
++#define DP2HDMI_BOOT_MS_MAX	5000
++
++/* The one DCP with a converter, for the parameter's setter. */
++static struct apple_dcp *dp2hdmi_dcp;
++static DEFINE_MUTEX(dp2hdmi_dcp_lock);
++
++/* Called with hpd_mutex held. */
++static void dcp_dp2hdmi_power_on(struct apple_dcp *dcp)
++{
++	if (!dcp->dp2hdmi_off)
++		return;
++
++	gpiod_set_value_cansleep(dcp->dp2hdmi_pwren, 1);
++	dcp->dp2hdmi_off = false;
++	dcp->dp2hdmi_on_at = ktime_get();
++	dev_info(dcp->dev, "DP2HDMI powered up\n");
++}
++
++/* Called with hpd_mutex held. */
++static void dcp_dp2hdmi_wait_ready(struct apple_dcp *dcp)
++{
++	s64 boot_ms = min(hdmi_boot_ms, DP2HDMI_BOOT_MS_MAX);
++	s64 left;
++
++	if (!dcp->dp2hdmi_pwren || !dcp->dp2hdmi_on_at)
++		return;
++
++	left = boot_ms - ktime_ms_delta(ktime_get(), dcp->dp2hdmi_on_at);
++	if (left > 0)
++		msleep(left);
++}
++
++static void dcp_dp2hdmi_idle_later(struct apple_dcp *dcp)
++{
++	if (hdmi_idle_off && dcp->dp2hdmi_pwren && dcp->hdmi_hpd)
++		mod_delayed_work(system_dfl_wq, &dcp->dp2hdmi_idle_work,
++				 DP2HDMI_IDLE_DELAY);
++}
++
+ #define DPTX_CONNECT_TIMEOUT msecs_to_jiffies(2000)
+ 
+ static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
+@@ -385,6 +443,9 @@
+ 	if (dcp->dptxport[port].connected)
+ 		goto out_unlock;
+ 
++	dcp_dp2hdmi_power_on(dcp);
++	dcp_dp2hdmi_wait_ready(dcp);
++
+ 	reinit_completion(&dcp->dptxport[port].linkcfg_completion);
+ 	dcp->dptxport[port].atcphy = dcp->phy;
+ 	dptxport_connect(dcp->dptxport[port].service, 0, dcp->dptx_phy, dcp->dptx_die);
+@@ -459,6 +520,66 @@
+ 	return dcp_dptx_disconnect(dcp, port);
+ }
+ 
++/*
++ * Runs a few seconds after the HPD line went low, or the CRTC off. The
++ * DCP has seen the display go by then, so what is left is what
++ * dcp_poweroff() does for a CRTC switched off with nothing plugged in.
++ */
++static void dcp_dp2hdmi_idle(struct work_struct *work)
++{
++	struct apple_dcp *dcp = container_of(to_delayed_work(work),
++					     struct apple_dcp,
++					     dp2hdmi_idle_work);
++
++	if (!hdmi_idle_off || dcp->crashed || dcp->crtc_on ||
++	    gpiod_get_value_cansleep(dcp->hdmi_hpd))
++		return;
++
++	disconnected_hpd_event(dcp->connector);
++	dcp_dptx_disconnect(dcp, 0);
++
++	mutex_lock(&dcp->hpd_mutex);
++	if (!dcp->dp2hdmi_off && !dcp->dptxport[0].connected &&
++	    !gpiod_get_value_cansleep(dcp->hdmi_hpd)) {
++		gpiod_set_value_cansleep(dcp->dp2hdmi_pwren, 0);
++		dcp->dp2hdmi_off = true;
++		dev_info(dcp->dev, "DP2HDMI powered down\n");
++	}
++	mutex_unlock(&dcp->hpd_mutex);
++}
++
++static int hdmi_idle_off_set(const char *val, const struct kernel_param *kp)
++{
++	struct apple_dcp *dcp;
++	int ret;
++
++	ret = param_set_bool(val, kp);
++	if (ret)
++		return ret;
++
++	mutex_lock(&dp2hdmi_dcp_lock);
++	dcp = dp2hdmi_dcp;
++	if (dcp && hdmi_idle_off) {
++		mod_delayed_work(system_dfl_wq, &dcp->dp2hdmi_idle_work, 0);
++	} else if (dcp) {
++		cancel_delayed_work_sync(&dcp->dp2hdmi_idle_work);
++		mutex_lock(&dcp->hpd_mutex);
++		dcp_dp2hdmi_power_on(dcp);
++		mutex_unlock(&dcp->hpd_mutex);
++	}
++	mutex_unlock(&dp2hdmi_dcp_lock);
++
++	return 0;
++}
++
++static const struct kernel_param_ops hdmi_idle_off_ops = {
++	.set = hdmi_idle_off_set,
++	.get = param_get_bool,
++};
++module_param_cb(hdmi_idle_off, &hdmi_idle_off_ops, &hdmi_idle_off, 0644);
++MODULE_PARM_DESC(hdmi_idle_off,
++		 "Power the DP to HDMI converter down while nothing is plugged into the HDMI port");
++
+ static irqreturn_t dcp_dp2hdmi_hpd(int irq, void *data)
+ {
+ 	struct apple_dcp *dcp = data;
+@@ -473,6 +594,11 @@
+ 	dev_info(dcp->dev, "DP2HDMI HPD irq, connected:%d\n", connected);
+ 
+ 	if (connected) {
++		/* The converter starts while the line settles. */
++		mutex_lock(&dcp->hpd_mutex);
++		dcp_dp2hdmi_power_on(dcp);
++		mutex_unlock(&dcp->hpd_mutex);
++
+ 		msleep(500);
+ 		connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);
+ 		dev_info(dcp->dev, "DP2HDMI HPD irq, 500ms debounce: connected:%d\n", connected);
+@@ -480,6 +606,8 @@
+ 
+ 	if (connected)
+ 		dcp_dptx_connect(dcp, 0);
++	else
++		dcp_dp2hdmi_idle_later(dcp);
+ 
+ 	return IRQ_HANDLED;
+ }
+@@ -612,6 +740,9 @@
+ 			dcp_dptx_connect(dcp, 0);
+ 		else
+ 			_dcp_poweroff(dcp);
++
++		if (!connected)
++			dcp_dp2hdmi_idle_later(dcp);
+ 	}
+ 
+ 	if (dcp->hdmi_hpd_irq)
+@@ -667,6 +798,8 @@
+ {
+ 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+ 
++	dcp->crtc_on = true;
++
+ 	if (dcp->hdmi_hpd) {
+ 		bool connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);
+ 		dev_info(dcp->dev, "%s: DP2HDMI HPD connected:%d\n", __func__, connected);
+@@ -702,12 +835,14 @@
+ 		av_service_disconnect(dcp);
+ 
+ 	_dcp_poweroff(dcp);
++	dcp->crtc_on = false;
+ 
+ 	if (dcp->hdmi_hpd) {
+ 		bool connected = gpiod_get_value_cansleep(dcp->hdmi_hpd);
+ 		if (!connected) {
+ 			disconnected_hpd_event(dcp->connector);
+ 			dcp_dptx_disconnect(dcp, 0);
++			dcp_dp2hdmi_idle_later(dcp);
+ 		}
+ 	}
+ }
+@@ -1017,6 +1152,7 @@
+ 		dev_info(dev, "DCP index:%u dptx target phy: %u dptx die: %u\n",
+ 			 dcp->index, dcp->dptx_phy, dcp->dptx_die);
+ 	mutex_init(&dcp->hpd_mutex);
++	INIT_DELAYED_WORK(&dcp->dp2hdmi_idle_work, dcp_dp2hdmi_idle);
+ 
+ 	if (!show_notch)
+ 		ret = of_property_read_u32(dev->of_node, "apple,notch-height",
+@@ -1098,7 +1234,15 @@
+ 	if (ret)
+ 		return dev_err_probe(dev, ret,
+ 				     "Failed to boot RTKit: %d\n", ret);
+-	return ret;
++
++	/* Last, since a bind that fails is not followed by an unbind. */
++	if (dcp->dp2hdmi_pwren && dcp->hdmi_hpd) {
++		mutex_lock(&dp2hdmi_dcp_lock);
++		dp2hdmi_dcp = dcp;
++		mutex_unlock(&dp2hdmi_dcp_lock);
++	}
++
++	return 0;
+ }
+ 
+ static void destroy_piodma_device(struct apple_dcp *dcp)
+@@ -1123,6 +1267,12 @@
+ 	if (dcp->hdmi_hpd_irq)
+ 		disable_irq(dcp->hdmi_hpd_irq);
+ 
++	mutex_lock(&dp2hdmi_dcp_lock);
++	if (dp2hdmi_dcp == dcp)
++		dp2hdmi_dcp = NULL;
++	mutex_unlock(&dp2hdmi_dcp_lock);
++	cancel_delayed_work_sync(&dcp->dp2hdmi_idle_work);
++
+ 	typec_mux_put(dcp->typec_mux);
+ 
+ 	if (dcp->avep) {
