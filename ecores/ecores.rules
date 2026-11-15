@@ -1,0 +1,7 @@
+# wmutils: installed as /etc/udev/rules.d/60-wmutils-ecores.rules
+# by ecores/install.sh. When the charger is plugged in or out, the
+# wmutils-batch cgroup gets every core or the efficiency cores only. The
+# kernel sends a "change" for the mains supply each time. See
+# ecores/README.md.
+ACTION=="change", SUBSYSTEM=="power_supply", ATTR{type}=="Mains", \
+  RUN+="/usr/local/share/wmutils/ecores/ecores.sh power"

@@ -1,0 +1,487 @@
+From: kkw537 <171009921+kkw537@users.noreply.github.com>
+Subject: [PATCH] usb: dwc3: apple, phy: apple: atc: runtime PM while no cable
+ is connected
+
+Neither dwc3-apple nor the Type-C PHY has runtime PM, and the power
+domain framework counts a device without it as in use. So the power
+domain of every USB-C port (ps_atcN_usb, with dwc3, its two DARTs and
+the PHY in it, and ps_atcN_common above) is on for as long as the
+machine is up, cable or no cable, although dwc3 is held in reset and
+the PHY is powered down whenever nothing is connected. The same
+domains are already switched off and on in that state by every
+suspend to idle.
+
+dwc3-apple: a reference is held from the start of dwc3_apple_init() for
+a cable until dwc3 is back in reset, so the device is suspended in
+DWC3_APPLE_PROBE_PENDING and DWC3_APPLE_NO_CABLE. dwc3_core_probe()
+enables and forbids runtime PM itself; ours is out of its way while it
+runs, and what user space asked for in power/control is put back after
+it. The DARTs follow dwc3 through their device links.
+
+phy-apple-atc: everything that touches the registers (the PHY ops, the
+dwc3 reset, the Type-C mux) takes a reference first, and one more is
+held for as long as the registers are in any state but the one probe
+leaves them in: PHY off, dwc3 in reset, PIPE interface on the dummy
+PHY. Only in that state can the domain go, and on resume the registers
+are put into it again the way probe does, whatever the domain left in
+them. The PHY of the HDMI port is in DisplayPort mode from the DCP's
+probe on, and so is never suspended. The callbacks are for runtime PM
+only: system sleep is as it was, and a PHY in use does not stop it.
+
+Runtime PM is forbidden on both, as dwc3's own is, so nothing changes
+until "auto" is written to power/control of a port's dwc3 and PHY:
+
+  /sys/bus/platform/devices/*.usb/power/control
+  /sys/bus/platform/devices/*.phy/power/control
+
+and "on" powers the port again at once. This way it can be tried one
+port at a time.
+
+Also set the driver data in dwc3_apple_probe(): dwc3_apple_remove()
+reads it, and until the first cable nothing had set it.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+--- a/drivers/phy/apple/atc.c
++++ b/drivers/phy/apple/atc.c
+@@ -34,6 +34,7 @@
+ #include <linux/of_device.h>
+ #include <linux/phy/phy.h>
+ #include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
+ #include <linux/reset-controller.h>
+ #include <linux/soc/apple/tunable.h>
+ #include <linux/types.h>
+@@ -618,6 +619,9 @@
+  * @swap_lanes: True if lanes must be swapped due to cable orientation
+  * @dp_link_rate: DisplayPort link rate
+  * @pipehandler_up: True if the PIPE mux ("pipehandler") is set to USB3 or USB4 mode
++ * @dwc3_in_reset: True while dwc3 is held in reset
++ * @usb2_prepared: True from the USB2 PHY's mode being set until dwc3's next reset
++ * @rpm_busy: True while a runtime PM reference is held for the state of the registers
+  * @regs: Memory-mapped registers
+  * @regs.core: Core registers
+  * @regs.axi2af: AXI to Apple Fabric interface registers
+@@ -654,6 +658,9 @@
+ 	int dp_link_rate;
+ 	bool swap_lanes;
+ 	bool pipehandler_up;
++	bool dwc3_in_reset;
++	bool usb2_prepared;
++	bool rpm_busy;
+ 
+ 	struct {
+ 		void __iomem *core;
+@@ -914,6 +921,54 @@
+ 	core_mask32(atcphy, reg, clear, 0);
+ }
+ 
++/*
++ * Runtime PM. The power domain may go, and with it what the registers
++ * hold, only while there is nothing in them to lose: the PHY off, dwc3 in
++ * reset and its PIPE interface on the dummy PHY, which is how probe leaves
++ * them and how they are again once a cable is gone. Everything that
++ * touches the registers takes a reference first, and one more is held for
++ * as long as they are in any other state.
++ */
++#define ATCPHY_AUTOSUSPEND_MS 1000
++
++static bool atcphy_busy(struct apple_atcphy *atcphy)
++{
++	return atcphy->mode != APPLE_ATCPHY_MODE_OFF || atcphy->pipehandler_up ||
++	       atcphy->usb2_prepared || !atcphy->dwc3_in_reset;
++}
++
++static struct apple_atcphy *atcphy_rpm_get(struct apple_atcphy *atcphy)
++{
++	int ret = pm_runtime_resume_and_get(atcphy->dev);
++
++	if (ret < 0) {
++		dev_err(atcphy->dev, "Failed to resume: %d\n", ret);
++		return NULL;
++	}
++
++	return atcphy;
++}
++
++/* Called without the lock, after whatever changed the state. */
++static void atcphy_rpm_put(struct apple_atcphy *atcphy)
++{
++	scoped_guard(mutex, &atcphy->lock) {
++		bool busy = atcphy_busy(atcphy);
++
++		if (busy && !atcphy->rpm_busy)
++			pm_runtime_get_noresume(atcphy->dev);
++		else if (!busy && atcphy->rpm_busy)
++			pm_runtime_put_noidle(atcphy->dev);
++		atcphy->rpm_busy = busy;
++	}
++
++	pm_runtime_put_autosuspend(atcphy->dev);
++}
++
++/* Declared ahead of guard(mutex), so that the lock is dropped first. */
++DEFINE_CLASS(atcphy_rpm, struct apple_atcphy *, if (_T) atcphy_rpm_put(_T),
++	     atcphy_rpm_get(atcphy), struct apple_atcphy *atcphy)
++
+ static const struct atcphy_mode_configuration *atcphy_get_mode_config(struct apple_atcphy *atcphy,
+ 								      enum atcphy_mode mode)
+ {
+@@ -1684,6 +1739,9 @@
+ 	int ret;
+ 	u32 reg;
+ 
++	CLASS(atcphy_rpm, rpm)(atcphy);
++	if (!rpm)
++		return -EIO;
+ 	guard(mutex)(&atcphy->lock);
+ 	mode_cfg = atcphy_get_mode_config(atcphy, atcphy->mode);
+ 	cfg = &dp_lr_config[lr];
+@@ -2001,6 +2059,9 @@
+ {
+ 	struct apple_atcphy *atcphy = phy_get_drvdata(phy);
+ 
++	CLASS(atcphy_rpm, rpm)(atcphy);
++	if (!rpm)
++		return -EIO;
+ 	guard(mutex)(&atcphy->lock);
+ 
+ 	switch (mode) {
+@@ -2014,6 +2075,9 @@
+ 		return -EINVAL;
+ 	}
+ 
++	/* Has to last until dwc3 is up, and goes with its next reset. */
++	atcphy->usb2_prepared = true;
++
+ 	return 0;
+ }
+ 
+@@ -2027,6 +2091,9 @@
+ 	struct apple_atcphy *atcphy = phy_get_drvdata(phy);
+ 	int ret;
+ 
++	CLASS(atcphy_rpm, rpm)(atcphy);
++	if (!rpm)
++		return -EIO;
+ 	guard(mutex)(&atcphy->lock);
+ 
+ 	ret = atcphy_configure_pipehandler_dummy(atcphy);
+@@ -2045,6 +2112,9 @@
+ {
+ 	struct apple_atcphy *atcphy = phy_get_drvdata(phy);
+ 
++	CLASS(atcphy_rpm, rpm)(atcphy);
++	if (!rpm)
++		return -EIO;
+ 	guard(mutex)(&atcphy->lock);
+ 
+ 	/*
+@@ -2195,6 +2265,7 @@
+ 	clear32(atcphy->regs.pipehandler + PIPEHANDLER_AON_GEN, PIPEHANDLER_AON_GEN_DWC3_RESET_N);
+ 	set32(atcphy->regs.pipehandler + PIPEHANDLER_AON_GEN,
+ 	      PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN);
++	atcphy->dwc3_in_reset = true;
+ }
+ 
+ static int atcphy_dwc3_reset_assert(struct reset_controller_dev *rcdev, unsigned long id)
+@@ -2202,6 +2273,9 @@
+ 	struct apple_atcphy *atcphy = container_of(rcdev, struct apple_atcphy, rcdev);
+ 	int ret;
+ 
++	CLASS(atcphy_rpm, rpm)(atcphy);
++	if (!rpm)
++		return -EIO;
+ 	guard(mutex)(&atcphy->lock);
+ 
+ 	_atcphy_dwc3_reset_assert(atcphy);
+@@ -2215,6 +2289,7 @@
+ 	}
+ 
+ 	atcphy_usb2_power_off(atcphy);
++	atcphy->usb2_prepared = false;
+ 
+ 	return 0;
+ }
+@@ -2223,11 +2298,15 @@
+ {
+ 	struct apple_atcphy *atcphy = container_of(rcdev, struct apple_atcphy, rcdev);
+ 
++	CLASS(atcphy_rpm, rpm)(atcphy);
++	if (!rpm)
++		return -EIO;
+ 	guard(mutex)(&atcphy->lock);
+ 
+ 	clear32(atcphy->regs.pipehandler + PIPEHANDLER_AON_GEN,
+ 		PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN);
+ 	set32(atcphy->regs.pipehandler + PIPEHANDLER_AON_GEN, PIPEHANDLER_AON_GEN_DWC3_RESET_N);
++	atcphy->dwc3_in_reset = false;
+ 
+ 	return 0;
+ }
+@@ -2301,6 +2380,9 @@
+ 	struct apple_atcphy *atcphy = typec_mux_get_drvdata(mux);
+ 	enum atcphy_mode target_mode;
+ 
++	CLASS(atcphy_rpm, rpm)(atcphy);
++	if (!rpm)
++		return -EIO;
+ 	guard(mutex)(&atcphy->lock);
+ 
+ 	if (state->mode == TYPEC_STATE_SAFE) {
+@@ -2485,6 +2567,15 @@
+ 	return 0;
+ }
+ 
++/* An unbind with the PHY in use: the reference held for that goes too. */
++static void atcphy_rpm_release(void *data)
++{
++	struct apple_atcphy *atcphy = data;
++
++	if (atcphy->rpm_busy)
++		pm_runtime_put_noidle(atcphy->dev);
++}
++
+ static int atcphy_probe(struct platform_device *pdev)
+ {
+ 	struct apple_atcphy *atcphy;
+@@ -2514,9 +2605,71 @@
+ 	atcphy->mode = APPLE_ATCPHY_MODE_OFF;
+ 	atcphy->pipehandler_up = false;
+ 
+-	return atcphy_probe_finalize(atcphy);
++	/*
++	 * Forbidden until user space writes "auto" to power/control: the
++	 * PHY then stays powered, as it did before it had runtime PM.
++	 */
++	ret = devm_add_action(dev, atcphy_rpm_release, atcphy);
++	if (ret)
++		return ret;
++
++	pm_runtime_get_noresume(dev);
++	pm_runtime_set_active(dev);
++	pm_runtime_set_autosuspend_delay(dev, ATCPHY_AUTOSUSPEND_MS);
++	pm_runtime_use_autosuspend(dev);
++	ret = devm_pm_runtime_enable(dev);
++	if (ret) {
++		pm_runtime_put_noidle(dev);
++		return ret;
++	}
++	pm_runtime_forbid(dev);
++
++	ret = atcphy_probe_finalize(atcphy);
++	if (ret) {
++		pm_runtime_put_noidle(dev);
++		return ret;
++	}
++
++	pm_runtime_put(dev);
++
++	return 0;
++}
++
++static int atcphy_runtime_suspend(struct device *dev)
++{
++	struct apple_atcphy *atcphy = dev_get_drvdata(dev);
++
++	guard(mutex)(&atcphy->lock);
++
++	return atcphy_busy(atcphy) ? -EBUSY : 0;
+ }
+ 
++/*
++ * The registers hold whatever the power domain left in them, as they hold
++ * whatever the bootloader left at probe: the same is done about it.
++ */
++static int atcphy_runtime_resume(struct device *dev)
++{
++	struct apple_atcphy *atcphy = dev_get_drvdata(dev);
++
++	guard(mutex)(&atcphy->lock);
++
++	_atcphy_dwc3_reset_assert(atcphy);
++	atcphy_usb2_power_off(atcphy);
++	atcphy_power_off(atcphy);
++	atcphy_setup_pipehandler(atcphy);
++
++	return 0;
++}
++
++/*
++ * Runtime PM only. System sleep is left as it was without any of this: a
++ * PHY that is in use stays as it is, and must not stop the suspend.
++ */
++static const struct dev_pm_ops atcphy_pm_ops = {
++	RUNTIME_PM_OPS(atcphy_runtime_suspend, atcphy_runtime_resume, NULL)
++};
++
+ static const struct atcphy_hw atcphy_hw_t8103 = {
+ 	.gen = ATCPHY_GENERATION_T8103,
+ 	.aciophy_lane_mode = ACIOPHY_LANE_MODE_T8103,
+@@ -2542,6 +2695,7 @@
+ 	.driver = {
+ 		.name = "phy-apple-atc",
+ 		.of_match_table = atcphy_match,
++		.pm = pm_ptr(&atcphy_pm_ops),
+ 	},
+ 	.probe = atcphy_probe,
+ };
+--- a/drivers/usb/dwc3/dwc3-apple.c
++++ b/drivers/usb/dwc3/dwc3-apple.c
+@@ -12,6 +12,7 @@
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+ #include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
+ #include <linux/reset.h>
+ 
+ #include "glue.h"
+@@ -67,6 +68,12 @@
+  * in DWC3_APPLE_PROBE_PENDING.
+  * Once a cable is connected we then keep track of the controller mode here by transitioning to
+  * DWC3_APPLE_HOST or DWC3_APPLE_DEVICE.
++ *
++ * Runtime PM follows these states: a reference is held from just before dwc3 is taken out of
++ * reset for a cable until it is back in reset, so that the power domain can go in
++ * DWC3_APPLE_PROBE_PENDING and DWC3_APPLE_NO_CABLE, where there is nothing in dwc3 to lose. It
++ * is forbidden, as dwc3's own is, until user space writes "auto" to power/control, and dwc3
++ * then stays powered as it did before.
+  */
+ enum dwc3_apple_state {
+ 	DWC3_APPLE_PROBE_PENDING, /* Before first cable connection, dwc3_core_probe not called */
+@@ -171,6 +178,8 @@
+ static int dwc3_apple_core_probe(struct dwc3_apple *appledwc)
+ {
+ 	struct dwc3_probe_data probe_data = {};
++	struct device *dev = appledwc->dev;
++	bool rpm_auto = dev->power.runtime_auto;
+ 	int ret;
+ 
+ 	lockdep_assert_held(&appledwc->lock);
+@@ -183,9 +192,22 @@
+ 	probe_data.skip_core_init_mode = true;
+ 	probe_data.properties = DWC3_DEFAULT_PROPERTIES;
+ 
++	/*
++	 * dwc3_core_probe() enables runtime PM itself and forbids it, and disables it again
++	 * where it fails. Ours is out of its way for as long as it runs, and what user space
++	 * asked for in power/control is put back after it.
++	 */
++	pm_runtime_disable(dev);
+ 	ret = dwc3_core_probe(&probe_data);
+-	if (ret)
++	if (ret) {
++		pm_runtime_set_active(dev);
++		pm_runtime_enable(dev);
++		if (!rpm_auto)
++			pm_runtime_forbid(dev);
+ 		return ret;
++	}
++	if (rpm_auto)
++		pm_runtime_allow(dev);
+ 
+ 	appledwc->state = DWC3_APPLE_NO_CABLE;
+ 	return 0;
+@@ -224,6 +246,13 @@
+ 
+ 	lockdep_assert_held(&appledwc->lock);
+ 
++	/* Held until dwc3_apple_exit(): the controller is powered while a cable is in. */
++	ret = pm_runtime_resume_and_get(appledwc->dev);
++	if (ret) {
++		dev_err(appledwc->dev, "Failed to resume, err=%d\n", ret);
++		return ret;
++	}
++
+ 	/*
+ 	 * The USB2 PHY on this platform must be configured for host or device mode while it is
+ 	 * still powered off and before dwc3 tries to access it. Otherwise, the new configuration
+@@ -240,13 +269,15 @@
+ 		break;
+ 	default:
+ 		/* Unreachable unless there's a bug in this driver */
++		pm_runtime_put(appledwc->dev);
+ 		return -EINVAL;
+ 	}
+ 
+ 	ret = reset_control_deassert(appledwc->reset);
+ 	if (ret) {
+ 		dev_err(appledwc->dev, "Failed to deassert reset, err=%d\n", ret);
+-		return ret;
++		/* Asserting it puts the USB2 PHY back as it was, too. */
++		goto reset_assert;
+ 	}
+ 
+ 	ret = dwc3_apple_core_init(appledwc);
+@@ -309,6 +340,7 @@
+ 	ret_reset = reset_control_assert(appledwc->reset);
+ 	if (ret_reset)
+ 		dev_warn(appledwc->dev, "Failed to assert reset, err=%d\n", ret_reset);
++	pm_runtime_put(appledwc->dev);
+ 
+ 	return ret;
+ }
+@@ -342,12 +374,11 @@
+ 	appledwc->state = DWC3_APPLE_NO_CABLE;
+ 
+ 	ret = reset_control_assert(appledwc->reset);
+-	if (ret) {
++	if (ret)
+ 		dev_err(appledwc->dev, "Failed to assert reset, err=%d\n", ret);
+-		return ret;
+-	}
++	pm_runtime_put(appledwc->dev);
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ static int dwc3_usb_role_switch_set(struct usb_role_switch *sw, enum usb_role role)
+@@ -444,6 +475,8 @@
+ 
+ 	appledwc->dev = &pdev->dev;
+ 	mutex_init(&appledwc->lock);
++	/* dwc3_core_probe() sets the same; remove needs it before there was a cable. */
++	platform_set_drvdata(pdev, &appledwc->dwc);
+ 
+ 	appledwc->reset = devm_reset_control_get_exclusive(dev, NULL);
+ 	if (IS_ERR(appledwc->reset))
+@@ -475,9 +508,22 @@
+ 	 * details.
+ 	 */
+ 	appledwc->state = DWC3_APPLE_PROBE_PENDING;
++
++	pm_runtime_get_noresume(dev);
++	pm_runtime_set_active(dev);
++	pm_runtime_enable(dev);
++	pm_runtime_forbid(dev);
++
+ 	ret = dwc3_apple_setup_role_switch(appledwc);
+-	if (ret)
++	if (ret) {
++		pm_runtime_allow(dev);
++		pm_runtime_disable(dev);
++		pm_runtime_set_suspended(dev);
++		pm_runtime_put_noidle(dev);
+ 		return dev_err_probe(&pdev->dev, ret, "Failed to setup role switch\n");
++	}
++
++	pm_runtime_put(dev);
+ 
+ 	return 0;
+ }
+@@ -497,8 +543,13 @@
+ 	 * dwc3_apple_exit can be called unconditionally because it checks the state itself.
+ 	 */
+ 	dwc3_apple_exit(appledwc);
+-	if (appledwc->state != DWC3_APPLE_PROBE_PENDING)
++	if (appledwc->state != DWC3_APPLE_PROBE_PENDING) {
+ 		dwc3_core_remove(&appledwc->dwc);
++	} else {
++		pm_runtime_allow(appledwc->dev);
++		pm_runtime_disable(appledwc->dev);
++		pm_runtime_set_suspended(appledwc->dev);
++	}
+ }
+ 
+ static const struct of_device_id dwc3_apple_of_match[] = {

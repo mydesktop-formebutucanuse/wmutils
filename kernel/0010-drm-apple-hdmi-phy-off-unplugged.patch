@@ -1,0 +1,609 @@
+From: kkw537 <171009921+kkw537@users.noreply.github.com>
+Subject: [PATCH] drm: apple: HDMI port's PHY and crossbar off while nothing is
+ plugged in
+
+The HDMI port of the 14 and 16 inch MacBook Pro is a DisplayPort output
+of the SoC: the DCP (dcpext) feeds the display crossbar, the crossbar
+the port's PHY (atcphy), the PHY the DP to HDMI converter. The driver
+connects the crossbar and switches the PHY to DisplayPort once, at
+probe, and both stay that way, with or without a cable. The PHY then
+counts as in use and never runtime suspends, the crossbar has no
+runtime PM at all, and the power domain the two share stays on.
+
+With the new parameter hdmi_idle_phy_off, the idle work of
+hdmi_idle_off, which powers the converter down, also switches the PHY
+off and disconnects the crossbar, and dcp_dp2hdmi_power_on() sets both
+up again before it powers the converter up. The order is that of
+probe: the crossbar changes while the PHY is off.
+
+The crossbar gets runtime PM for this: a mux that is connected holds a
+reference, and resume writes the tunable and the disconnected state
+again, as probe does. As with the PHY, it is forbidden until user space
+writes "auto" to power/control, so that without that the crossbar stays
+powered as before:
+
+  /sys/module/appledrm/parameters/hdmi_idle_phy_off
+  /sys/bus/platform/devices/130304c000.mux/power/control
+  /sys/bus/platform/devices/1303000000.phy/power/control
+
+The parameter does nothing without hdmi_idle_off and can be written at
+any time; writing 0 sets the crossbar and the PHY up again at once. It
+is off unless asked for: the DCP has not been seen to run with its
+output disconnected.
+
+The DCP itself keeps running. Its power domain is always-on in the
+device tree, and the driver cannot shut a DCP down and start it again.
+
+If the PHY does not come up, the path counts as still released, and
+dcp_dptx_connect() gives up for the next HPD interrupt or modeset to
+try again.
+
+The idle work now touches a PHY and a crossbar whose power domain goes
+late in a system suspend, so suspend cancels it and resume queues it
+again; for a suspend before the first bind it is set up in probe.
+
+Component unbind used to put the typec mux that probe got, and a second
+unbind put it again. It is now put where the platform device goes, so
+that it is there for the path after a bind that follows an unbind.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+--- a/drivers/gpu/drm/apple/dcp-internal.h
++++ b/drivers/gpu/drm/apple/dcp-internal.h
+@@ -267,6 +267,12 @@
+ 	bool dp2hdmi_off;
+ 	bool crtc_on;
+ 
++	/* hdmi_idle_phy_off: the crossbar and the PHY released with it */
++	u32 mux_index;
++	bool dp_path_switchable;
++	bool dp_path_off;
++	bool pm_suspended;
++
+ 	u32 dptx_phy;
+ 	u32 dptx_die;
+ 	int hdmi_hpd_irq;
+--- a/drivers/gpu/drm/apple/dcp.c
++++ b/drivers/gpu/drm/apple/dcp.c
+@@ -384,13 +384,86 @@
+ #define DP2HDMI_IDLE_DELAY	msecs_to_jiffies(3000)
+ #define DP2HDMI_BOOT_MS_MAX	5000
+ 
+-/* The one DCP with a converter, for the parameter's setter. */
++/*
++ * With hdmi_idle_phy_off as well, the way from the DCP to the converter
++ * is released along with it: the port's PHY is switched off and the
++ * display crossbar disconnected, which lets both runtime suspend and
++ * their power domain go. They are set up again before the converter is
++ * powered up. Off unless asked for: the DCP has not been seen to run
++ * with its output disconnected.
++ */
++static bool hdmi_idle_phy_off;
++
++/* The one DCP with a converter, for the parameters' setters. */
+ static struct apple_dcp *dp2hdmi_dcp;
+ static DEFINE_MUTEX(dp2hdmi_dcp_lock);
+ 
++static int dcp_dp_path_set_phy(struct apple_dcp *dcp, bool on)
++{
++	struct typec_altmode alt = {
++		.svid = USB_TYPEC_DP_SID,
++	};
++	struct typec_mux_state state = {
++		.alt = on ? &alt : NULL,
++		.mode = on ? TYPEC_DP_STATE_C : TYPEC_STATE_SAFE,
++	};
++
++	return typec_mux_set(dcp->typec_mux, &state);
++}
++
++/* Called with hpd_mutex held. */
++static void dcp_dp_path_on(struct apple_dcp *dcp)
++{
++	int ret;
++
++	if (!dcp->dp_path_off)
++		return;
++
++	/* As at probe: the crossbar is connected while the PHY is off. */
++	ret = mux_control_select(dcp->xbar, dcp->mux_index);
++	if (ret) {
++		dev_err(dcp->dev, "mux_control_select failed: %d\n", ret);
++		return;
++	}
++
++	ret = dcp_dp_path_set_phy(dcp, true);
++	if (ret) {
++		/* Still off: the next one to need the path tries again. */
++		dev_err(dcp->dev, "Failed to switch the PHY to DP: %d\n", ret);
++		mux_control_deselect(dcp->xbar);
++		return;
++	}
++
++	dcp->dp_path_off = false;
++	dev_info(dcp->dev, "DP path connected\n");
++}
++
++/* Called with hpd_mutex held. */
++static void dcp_dp_path_off(struct apple_dcp *dcp)
++{
++	int ret;
++
++	if (!dcp->dp_path_switchable || dcp->dp_path_off)
++		return;
++
++	/*
++	 * A PHY that failed to go off may be off all the same, or still in
++	 * DP: either way dcp_dp_path_on() sets it up again from here.
++	 */
++	ret = dcp_dp_path_set_phy(dcp, false);
++	if (ret)
++		dev_err(dcp->dev, "Failed to switch the PHY off: %d\n", ret);
++
++	mux_control_deselect(dcp->xbar);
++	dcp->dp_path_off = true;
++	dev_info(dcp->dev, "DP path released\n");
++}
++
+ /* Called with hpd_mutex held. */
+ static void dcp_dp2hdmi_power_on(struct apple_dcp *dcp)
+ {
++	dcp_dp_path_on(dcp);
++
+ 	if (!dcp->dp2hdmi_off)
+ 		return;
+ 
+@@ -416,7 +489,8 @@
+ 
+ static void dcp_dp2hdmi_idle_later(struct apple_dcp *dcp)
+ {
+-	if (hdmi_idle_off && dcp->dp2hdmi_pwren && dcp->hdmi_hpd)
++	if (hdmi_idle_off && dcp->dp2hdmi_pwren && dcp->hdmi_hpd &&
++	    !dcp->pm_suspended)
+ 		mod_delayed_work(system_dfl_wq, &dcp->dp2hdmi_idle_work,
+ 				 DP2HDMI_IDLE_DELAY);
+ }
+@@ -444,6 +518,11 @@
+ 		goto out_unlock;
+ 
+ 	dcp_dp2hdmi_power_on(dcp);
++	if (dcp->dp_path_off) {
++		/* Not connected: the next HPD or modeset tries again. */
++		ret = -EIO;
++		goto out_unlock;
++	}
+ 	dcp_dp2hdmi_wait_ready(dcp);
+ 
+ 	reinit_completion(&dcp->dptxport[port].linkcfg_completion);
+@@ -532,18 +611,22 @@
+ 					     dp2hdmi_idle_work);
+ 
+ 	if (!hdmi_idle_off || dcp->crashed || dcp->crtc_on ||
+-	    gpiod_get_value_cansleep(dcp->hdmi_hpd))
++	    dcp->pm_suspended || gpiod_get_value_cansleep(dcp->hdmi_hpd))
+ 		return;
+ 
+ 	disconnected_hpd_event(dcp->connector);
+ 	dcp_dptx_disconnect(dcp, 0);
+ 
+ 	mutex_lock(&dcp->hpd_mutex);
+-	if (!dcp->dp2hdmi_off && !dcp->dptxport[0].connected &&
++	if (!dcp->dptxport[0].connected &&
+ 	    !gpiod_get_value_cansleep(dcp->hdmi_hpd)) {
+-		gpiod_set_value_cansleep(dcp->dp2hdmi_pwren, 0);
+-		dcp->dp2hdmi_off = true;
+-		dev_info(dcp->dev, "DP2HDMI powered down\n");
++		if (!dcp->dp2hdmi_off) {
++			gpiod_set_value_cansleep(dcp->dp2hdmi_pwren, 0);
++			dcp->dp2hdmi_off = true;
++			dev_info(dcp->dev, "DP2HDMI powered down\n");
++		}
++		if (hdmi_idle_phy_off)
++			dcp_dp_path_off(dcp);
+ 	}
+ 	mutex_unlock(&dcp->hpd_mutex);
+ }
+@@ -560,7 +643,8 @@
+ 	mutex_lock(&dp2hdmi_dcp_lock);
+ 	dcp = dp2hdmi_dcp;
+ 	if (dcp && hdmi_idle_off) {
+-		mod_delayed_work(system_dfl_wq, &dcp->dp2hdmi_idle_work, 0);
++		if (!dcp->pm_suspended)
++			mod_delayed_work(system_dfl_wq, &dcp->dp2hdmi_idle_work, 0);
+ 	} else if (dcp) {
+ 		cancel_delayed_work_sync(&dcp->dp2hdmi_idle_work);
+ 		mutex_lock(&dcp->hpd_mutex);
+@@ -580,6 +664,39 @@
+ MODULE_PARM_DESC(hdmi_idle_off,
+ 		 "Power the DP to HDMI converter down while nothing is plugged into the HDMI port");
+ 
++static int hdmi_idle_phy_off_set(const char *val, const struct kernel_param *kp)
++{
++	struct apple_dcp *dcp;
++	int ret;
++
++	ret = param_set_bool(val, kp);
++	if (ret)
++		return ret;
++
++	mutex_lock(&dp2hdmi_dcp_lock);
++	dcp = dp2hdmi_dcp;
++	if (dcp && hdmi_idle_phy_off) {
++		if (!dcp->pm_suspended)
++			mod_delayed_work(system_dfl_wq, &dcp->dp2hdmi_idle_work, 0);
++	} else if (dcp) {
++		/* The idle work reads the parameter under hpd_mutex. */
++		mutex_lock(&dcp->hpd_mutex);
++		dcp_dp_path_on(dcp);
++		mutex_unlock(&dcp->hpd_mutex);
++	}
++	mutex_unlock(&dp2hdmi_dcp_lock);
++
++	return 0;
++}
++
++static const struct kernel_param_ops hdmi_idle_phy_off_ops = {
++	.set = hdmi_idle_phy_off_set,
++	.get = param_get_bool,
++};
++module_param_cb(hdmi_idle_phy_off, &hdmi_idle_phy_off_ops, &hdmi_idle_phy_off, 0644);
++MODULE_PARM_DESC(hdmi_idle_phy_off,
++		 "With hdmi_idle_off, switch the PHY of the HDMI port off and disconnect the display crossbar as well");
++
+ static irqreturn_t dcp_dp2hdmi_hpd(int irq, void *data)
+ {
+ 	struct apple_dcp *dcp = data;
+@@ -1152,7 +1269,6 @@
+ 		dev_info(dev, "DCP index:%u dptx target phy: %u dptx die: %u\n",
+ 			 dcp->index, dcp->dptx_phy, dcp->dptx_die);
+ 	mutex_init(&dcp->hpd_mutex);
+-	INIT_DELAYED_WORK(&dcp->dp2hdmi_idle_work, dcp_dp2hdmi_idle);
+ 
+ 	if (!show_notch)
+ 		ret = of_property_read_u32(dev->of_node, "apple,notch-height",
+@@ -1273,8 +1389,6 @@
+ 	mutex_unlock(&dp2hdmi_dcp_lock);
+ 	cancel_delayed_work_sync(&dcp->dp2hdmi_idle_work);
+ 
+-	typec_mux_put(dcp->typec_mux);
+-
+ 	if (dcp->avep) {
+ 		av_service_disconnect(dcp);
+ 		afk_shutdown(dcp->avep);
+@@ -1353,6 +1467,8 @@
+ 	dcp->dev = dev;
+ 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
+ 
++	INIT_DELAYED_WORK(&dcp->dp2hdmi_idle_work, dcp_dp2hdmi_idle);
++
+ 	platform_set_drvdata(pdev, dcp);
+ 
+ 	ret = dcp_create_piodma_iommu_dev(dcp);
+@@ -1442,9 +1558,12 @@
+ 				destroy_piodma_device(dcp);
+ 				return dev_err_probe(dev, PTR_ERR(dcp->xbar), "Failed to get dp-xbar\n");
+ 			}
++			dcp->mux_index = mux_index;
+ 			ret = mux_control_select(dcp->xbar, mux_index);
+ 			if (ret)
+ 				dev_warn(dev, "mux_control_select failed: %d\n", ret);
++			else
++				dcp->dp_path_switchable = true;
+ 
+ 			/*
+ 			 * Switch atcphy to DP-only. should move to a Macbook Pro
+@@ -1461,10 +1580,13 @@
+ 				};
+ 				int ret = typec_mux_set(dcp->typec_mux, &state);
+ 				dev_info(dev, "typec_mux_set() returned: %d\n", ret);
++				if (ret)
++					dcp->dp_path_switchable = false;
+ 			} else {
+ 				dev_info(dev, "fwnode_typec_mux_get() returned: %ld\n",
+ 						IS_ERR(dcp->typec_mux) ? PTR_ERR(dcp->typec_mux) : 0);
+ 				dcp->typec_mux = NULL;
++				dcp->dp_path_switchable = false;
+ 			}
+ 		}
+ 	}
+@@ -1478,6 +1600,9 @@
+ 
+ 	component_del(&pdev->dev, &dcp_comp_ops);
+ 
++	typec_mux_put(dcp->typec_mux);
++	dcp->typec_mux = NULL;
++
+ 	destroy_piodma_device(dcp);
+ }
+ 
+@@ -1487,6 +1612,9 @@
+ 
+ 	component_del(&pdev->dev, &dcp_comp_ops);
+ 
++	typec_mux_put(dcp->typec_mux);
++	dcp->typec_mux = NULL;
++
+ 	destroy_piodma_device(dcp);
+ }
+ 
+@@ -1502,6 +1630,14 @@
+ 		disconnected_hpd_event(dcp->connector);
+ 		dcp_dptx_disconnect(dcp, 0);
+ 	}
++
++	/*
++	 * The idle work touches the PHY and the crossbar, whose power
++	 * domain goes late in a suspend: none from here to resume.
++	 */
++	dcp->pm_suspended = true;
++	cancel_delayed_work_sync(&dcp->dp2hdmi_idle_work);
++
+ 	/*
+ 	 * Set the device as a wakeup device, which forces its power
+ 	 * domains to stay on. We need this as we do not support full
+@@ -1516,12 +1652,17 @@
+ {
+ 	struct apple_dcp *dcp = dev_get_drvdata(dev);
+ 
++	dcp->pm_suspended = false;
++
+ 	if (dcp->hdmi_hpd_irq)
+ 		enable_irq(dcp->hdmi_hpd_irq);
+ 
+ 	if (dcp->avep)
+ 		av_service_connect(dcp);
+ 
++	/* What a suspend may have cancelled; it looks at the port itself. */
++	dcp_dp2hdmi_idle_later(dcp);
++
+ 	return 0;
+ }
+ 
+--- a/drivers/mux/apple-display-crossbar.c
++++ b/drivers/mux/apple-display-crossbar.c
+@@ -17,6 +17,7 @@
+ #include <linux/of.h>
+ #include <linux/of_device.h>
+ #include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
+ 
+ /*
+  * T602x register interface is cleary different so most of the names below are
+@@ -86,15 +87,19 @@
+ enum { MUX_DPPHY = 0, MUX_DPIN0 = 1, MUX_DPIN1 = 2, MUX_MAX = 3 };
+ static const char *apple_dpxbar_names[MUX_MAX] = { "dpphy", "dpin0", "dpin1" };
+ 
++struct apple_dpxbar;
++
+ struct apple_dpxbar_hw {
+ 	unsigned int n_ufp;
+ 	u32 tunable;
+-	const struct mux_control_ops *ops;
++	bool has_tunable;
++	int (*set)(struct apple_dpxbar *dpxbar, unsigned int index, int state);
+ };
+ 
+ struct apple_dpxbar {
+ 	struct device *dev;
+ 	void __iomem *regs;
++	const struct apple_dpxbar_hw *hw;
+ 	int selected_dispext[MUX_MAX];
+ 	spinlock_t lock;
+ };
+@@ -118,10 +123,9 @@
+ 	dpxbar_mask32(xbar, reg, clear, 0);
+ }
+ 
+-static int apple_dpxbar_set_t602x(struct mux_control *mux, int state)
++static int apple_dpxbar_set_t602x(struct apple_dpxbar *dpxbar,
++				  unsigned int index, int state)
+ {
+-	struct apple_dpxbar *dpxbar = mux_chip_priv(mux->chip);
+-	unsigned int index = mux_control_get_index(mux);
+ 	unsigned long flags;
+ 	unsigned int mux_state;
+ 	unsigned int dispext_bit;
+@@ -221,10 +225,9 @@
+ 	return ret;
+ }
+ 
+-static int apple_dpxbar_set(struct mux_control *mux, int state)
++static int apple_dpxbar_set_t8103(struct apple_dpxbar *dpxbar,
++				  unsigned int index, int state)
+ {
+-	struct apple_dpxbar *dpxbar = mux_chip_priv(mux->chip);
+-	unsigned int index = mux_control_get_index(mux);
+ 	unsigned long flags;
+ 	unsigned int mux_state;
+ 	unsigned int dispext_bit;
+@@ -356,13 +359,65 @@
+ 	return ret;
+ }
+ 
++/*
++ * Runtime PM. The power domain may go, and with it what the registers
++ * hold, only while all three muxes are disconnected: there is nothing in
++ * the registers to lose then but the tunable and the disconnected state
++ * itself, and resume writes both again as probe does. A mux that is
++ * connected holds a reference, and every change takes one for as long as
++ * it writes.
++ */
++static int apple_dpxbar_set(struct mux_control *mux, int state)
++{
++	struct apple_dpxbar *dpxbar = mux_chip_priv(mux->chip);
++	unsigned int index = mux_control_get_index(mux);
++	bool was, is;
++	int ret;
++
++	ret = pm_runtime_resume_and_get(dpxbar->dev);
++	if (ret < 0) {
++		dev_err(dpxbar->dev, "Failed to resume: %d\n", ret);
++		return ret;
++	}
++
++	/* The mux core calls this for one mux from one caller at a time. */
++	was = dpxbar->selected_dispext[index] >= 0;
++	ret = dpxbar->hw->set(dpxbar, index, state);
++	is = dpxbar->selected_dispext[index] >= 0;
++
++	if (is && !was)
++		pm_runtime_get_noresume(dpxbar->dev);
++	else if (!is && was)
++		pm_runtime_put_noidle(dpxbar->dev);
++
++	pm_runtime_put(dpxbar->dev);
++
++	return ret;
++}
++
+ static const struct mux_control_ops apple_dpxbar_ops = {
+ 	.set = apple_dpxbar_set,
+ };
+ 
+-static const struct mux_control_ops apple_dpxbar_t602x_ops = {
+-	.set = apple_dpxbar_set_t602x,
+-};
++static void apple_dpxbar_write_tunable(struct apple_dpxbar *dpxbar)
++{
++	if (!dpxbar->hw->has_tunable)
++		return;
++
++	readl(dpxbar->regs + UNK_TUNABLE);
++	writel(dpxbar->hw->tunable, dpxbar->regs + UNK_TUNABLE);
++	readl(dpxbar->regs + UNK_TUNABLE);
++}
++
++/* An unbind with a mux connected: the reference held for that goes too. */
++static void apple_dpxbar_rpm_release(void *data)
++{
++	struct apple_dpxbar *dpxbar = data;
++
++	for (unsigned int i = 0; i < MUX_MAX; ++i)
++		if (dpxbar->selected_dispext[i] >= 0)
++			pm_runtime_put_noidle(dpxbar->dev);
++}
+ 
+ static int apple_dpxbar_probe(struct platform_device *pdev)
+ {
+@@ -378,19 +433,16 @@
+ 		return PTR_ERR(mux_chip);
+ 
+ 	dpxbar = mux_chip_priv(mux_chip);
+-	mux_chip->ops = hw->ops;
++	mux_chip->ops = &apple_dpxbar_ops;
+ 	spin_lock_init(&dpxbar->lock);
+ 
+ 	dpxbar->dev = dev;
++	dpxbar->hw = hw;
+ 	dpxbar->regs = devm_platform_ioremap_resource(pdev, 0);
+ 	if (IS_ERR(dpxbar->regs))
+ 		return PTR_ERR(dpxbar->regs);
+ 
+-	if (!of_device_is_compatible(dev->of_node, "apple,t6020-display-crossbar")) {
+-		readl(dpxbar->regs + UNK_TUNABLE);
+-		writel(hw->tunable, dpxbar->regs + UNK_TUNABLE);
+-		readl(dpxbar->regs + UNK_TUNABLE);
+-	}
++	platform_set_drvdata(pdev, dpxbar);
+ 
+ 	for (unsigned int i = 0; i < MUX_MAX; ++i) {
+ 		mux_chip->mux[i].states = hw->n_ufp;
+@@ -398,34 +450,85 @@
+ 		dpxbar->selected_dispext[i] = -1;
+ 	}
+ 
++	/*
++	 * Forbidden until user space writes "auto" to power/control: the
++	 * crossbar then stays powered, as it did before it had runtime PM.
++	 */
++	ret = devm_add_action(dev, apple_dpxbar_rpm_release, dpxbar);
++	if (ret)
++		return ret;
++
++	pm_runtime_get_noresume(dev);
++	pm_runtime_set_active(dev);
++	ret = devm_pm_runtime_enable(dev);
++	if (ret) {
++		pm_runtime_put_noidle(dev);
++		return ret;
++	}
++	pm_runtime_forbid(dev);
++
++	apple_dpxbar_write_tunable(dpxbar);
++
++	/* Registering disconnects the three muxes. */
+ 	ret = devm_mux_chip_register(dev, mux_chip);
+-	if (ret < 0)
++	if (ret < 0) {
++		pm_runtime_put_noidle(dev);
+ 		return ret;
++	}
++
++	pm_runtime_put(dev);
+ 
+ 	return 0;
+ }
+ 
++/*
++ * The registers hold whatever the power domain left in them, as they hold
++ * whatever the bootloader left at probe: the same is done about it. No
++ * mux is connected here, see apple_dpxbar_set().
++ */
++static int apple_dpxbar_runtime_resume(struct device *dev)
++{
++	struct apple_dpxbar *dpxbar = dev_get_drvdata(dev);
++
++	apple_dpxbar_write_tunable(dpxbar);
++
++	for (unsigned int i = 0; i < MUX_MAX; ++i)
++		dpxbar->hw->set(dpxbar, i, MUX_IDLE_DISCONNECT);
++
++	return 0;
++}
++
++/*
++ * Runtime PM only. System sleep is left as it was without any of this.
++ */
++static const struct dev_pm_ops apple_dpxbar_pm_ops = {
++	RUNTIME_PM_OPS(NULL, apple_dpxbar_runtime_resume, NULL)
++};
++
+ static const struct apple_dpxbar_hw apple_dpxbar_hw_t8103 = {
+ 	.n_ufp = 2,
+ 	.tunable = 0,
+-	.ops = &apple_dpxbar_ops,
++	.has_tunable = true,
++	.set = apple_dpxbar_set_t8103,
+ };
+ 
+ static const struct apple_dpxbar_hw apple_dpxbar_hw_t8112 = {
+ 	.n_ufp = 4,
+ 	.tunable = 4278196325,
+-	.ops = &apple_dpxbar_ops,
++	.has_tunable = true,
++	.set = apple_dpxbar_set_t8103,
+ };
+ 
+ static const struct apple_dpxbar_hw apple_dpxbar_hw_t6000 = {
+ 	.n_ufp = 9,
+ 	.tunable = 5,
+-	.ops = &apple_dpxbar_ops,
++	.has_tunable = true,
++	.set = apple_dpxbar_set_t8103,
+ };
+ 
+ static const struct apple_dpxbar_hw apple_dpxbar_hw_t6020 = {
+ 	.n_ufp = 9,
+-	.ops = &apple_dpxbar_t602x_ops,
++	.set = apple_dpxbar_set_t602x,
+ };
+ 
+ static const struct of_device_id apple_dpxbar_ids[] = {
+@@ -453,6 +556,7 @@
+ 	.driver = {
+ 		.name = "apple-display-crossbar",
+ 		.of_match_table	= apple_dpxbar_ids,
++		.pm = pm_ptr(&apple_dpxbar_pm_ops),
+ 	},
+ 	.probe = apple_dpxbar_probe,
+ };

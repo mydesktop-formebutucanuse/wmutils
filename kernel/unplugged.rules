@@ -1,0 +1,29 @@
+# wmutils: installed as /etc/udev/rules.d/60-wmutils-unplugged.rules
+# by kernel/install.sh. Lets the three USB-C ports' controllers and PHYs
+# sleep from boot while nothing is plugged into them: power/control is
+# "auto" instead of the "on" that
+# 0009-usb-apple-typec-runtime-pm.patch leaves them with. Both drivers
+# set "on" when they start, so the rule waits for the driver: "bind" is
+# the driver starting, "add" is udev going over the devices that are
+# already there. A kernel without the patch has no runtime PM for them,
+# and the write changes nothing.
+#
+# The names are those of the M1 Pro and M1 Max (t600x) device trees.
+ACTION=="add|bind", SUBSYSTEM=="platform", DRIVER=="dwc3-apple|phy-apple-atc", \
+  KERNEL=="702280000.usb|703000000.phy|b02280000.usb|b03000000.phy|f02280000.usb|f03000000.phy", \
+  ATTR{power/control}="auto"
+
+# The same for the HDMI port's PHY and the display crossbar in front of
+# it (0010-drm-apple-hdmi-phy-off-unplugged.patch). Both are in use, and
+# awake, until appledrm.hdmi_idle_phy_off releases them, so by itself
+# this changes nothing.
+ACTION=="add|bind", SUBSYSTEM=="platform", DRIVER=="phy-apple-atc|apple-display-crossbar", \
+  KERNEL=="1303000000.phy|130304c000.mux", \
+  ATTR{power/control}="auto"
+
+# The same for the four I2C buses' controllers, which then sleep between
+# transfers (0011-i2c-apple-runtime-pm.patch). Not a matter of plugs; it
+# is here because it is the same switch.
+ACTION=="add|bind", SUBSYSTEM=="platform", DRIVER=="i2c-apple", \
+  KERNEL=="39b040000.i2c|39b044000.i2c|39b048000.i2c|39b04c000.i2c", \
+  ATTR{power/control}="auto"

@@ -1,0 +1,162 @@
+From: kkw537 <171009921+kkw537@users.noreply.github.com>
+Subject: [PATCH] mmc: sdhci-pci-gli: runtime PM for the GL9755 while its slot
+ is empty
+
+sdhci-pci never drops the runtime PM reference it gets at probe unless
+the chip's fixes say allow_runtime_pm, and the GL9755's do not. So the
+SD card reader of the 14 and 16 inch MacBook Pro stays in D0 for as long
+as the machine is up, card or no card, and writing "auto" to its
+power/control does nothing.
+
+Give it runtime PM for the one case that asks nothing of a card: the
+empty slot. gl9755_runtime_suspend() refuses with -EBUSY while a card is
+present, so a card keeps the controller in D0 with its clock, its tuning
+and its UHS-II link as they were. With the slot empty the controller
+goes to D3hot 50 ms after the last use and its link to L1, and the root
+port above it can follow.
+
+Suspended, the controller has its interrupts masked and signals a card
+only through PME, which the PCI core turns into a resume. For that the
+suspend sets "wakeup on card insertion" in the controller's wakeup
+control register, with the insertion event left on in the interrupt
+status enable register as the SDHCI specification asks; so far only
+system suspend did. The resume is what has to notice the card:
+gl9755_runtime_resume() starts a rescan when it finds one. A card that
+comes in before the wakeup is set up is caught by a second check.
+
+It is off unless asked for:
+
+  modprobe sdhci_pci gl9755_runtime_pm=1
+
+(sdhci_pci.gl9755_runtime_pm=1 on the kernel command line), read when
+the controller is probed. Whether a card put in wakes the controller
+depends on PME from D3hot reaching the root port, and that has to be
+tried on the board. With it on, power/control is the switch at run
+time: "on" keeps the controller in D0.
+
+Until the first PME has come through, the PCI core also polls a
+suspended device for it once a second while the port above is awake.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+--- a/drivers/mmc/host/sdhci-pci-gli.c
++++ b/drivers/mmc/host/sdhci-pci-gli.c
+@@ -14,6 +14,7 @@
+ #include <linux/delay.h>
+ #include <linux/of.h>
+ #include <linux/iopoll.h>
++#include <linux/module.h>
+ #include "sdhci.h"
+ #include "sdhci-cqhci.h"
+ #include "sdhci-pci.h"
+@@ -1581,10 +1582,25 @@
+ 	return 0;
+ }
+ 
++/*
++ * Runtime PM for the GL9755 while its slot is empty. Off, as it is unless
++ * asked for, the controller stays in D0 as it did before there was any:
++ * whether a card put in wakes the controller from D3hot depends on PME
++ * reaching the root port, which not every board has been seen to do.
++ * Read when the controller is probed.
++ */
++static bool gl9755_runtime_pm;
++module_param(gl9755_runtime_pm, bool, 0644);
++MODULE_PARM_DESC(gl9755_runtime_pm,
++		 "Suspend a GL9755 at run time while its slot is empty");
++
+ static int gli_probe_slot_gl9755(struct sdhci_pci_slot *slot)
+ {
+ 	struct sdhci_host *host = slot->host;
+ 
++	if (!gl9755_runtime_pm)
++		slot->chip->allow_runtime_pm = false;
++
+ 	gl9755_hw_setting(slot);
+ 	gli_pcie_enable_msi(slot);
+ 	slot->host->mmc->caps2 |= MMC_CAP2_NO_SDIO;
+@@ -1916,6 +1932,72 @@
+ }
+ #endif
+ 
++#ifdef CONFIG_PM
++static bool gl9755_card_present(struct sdhci_host *host)
++{
++	return sdhci_readl(host, SDHCI_PRESENT_STATE) & SDHCI_CARD_PRESENT;
++}
++
++/*
++ * A wakeup event is signalled only for what is also on in the interrupt
++ * status enable register (SD Host Controller specification, "Wakeup
++ * Signal Table"), which sdhci_runtime_suspend_host() has just cleared and
++ * sdhci_runtime_resume_host() sets again.
++ */
++static void gl9755_wake_on_insert(struct sdhci_host *host, bool on)
++{
++	u8 val = sdhci_readb(host, SDHCI_WAKE_UP_CONTROL);
++
++	val &= ~(SDHCI_WAKE_ON_INSERT | SDHCI_WAKE_ON_REMOVE | SDHCI_WAKE_ON_INT);
++	if (on)
++		val |= SDHCI_WAKE_ON_INSERT;
++	sdhci_writeb(host, val, SDHCI_WAKE_UP_CONTROL);
++	if (on)
++		sdhci_writel(host, SDHCI_INT_CARD_INSERT, SDHCI_INT_ENABLE);
++}
++
++/*
++ * Only with an empty slot: a card keeps the controller in D0, with its
++ * clock, its tuning and its UHS-II link as they are. Suspended, the
++ * controller signals nothing but PME, for a card put in, which the PCI
++ * core turns into a resume, so it is the resume that has to notice the
++ * card.
++ */
++static int gl9755_runtime_suspend(struct sdhci_pci_chip *chip)
++{
++	struct sdhci_host *host = chip->slots[0]->host;
++
++	if (gl9755_card_present(host))
++		return -EBUSY;
++
++	sdhci_runtime_suspend_host(host);
++	gl9755_wake_on_insert(host, true);
++
++	/* One that came in before the wakeup was set up. */
++	if (gl9755_card_present(host)) {
++		gl9755_wake_on_insert(host, false);
++		sdhci_runtime_resume_host(host, 0);
++		mmc_detect_change(host->mmc, msecs_to_jiffies(200));
++		return -EBUSY;
++	}
++
++	return 0;
++}
++
++static int gl9755_runtime_resume(struct sdhci_pci_chip *chip)
++{
++	struct sdhci_host *host = chip->slots[0]->host;
++
++	gl9755_wake_on_insert(host, false);
++	sdhci_runtime_resume_host(host, 0);
++
++	if (gl9755_card_present(host))
++		mmc_detect_change(host->mmc, msecs_to_jiffies(200));
++
++	return 0;
++}
++#endif
++
+ #ifdef CONFIG_PM_SLEEP
+ static int sdhci_pci_gli_resume(struct sdhci_pci_chip *chip)
+ {
+@@ -2054,6 +2136,11 @@
+ #ifdef CONFIG_PM_SLEEP
+ 	.resume         = sdhci_pci_gli_resume,
+ #endif
++#ifdef CONFIG_PM
++	.runtime_suspend = gl9755_runtime_suspend,
++	.runtime_resume	= gl9755_runtime_resume,
++	.allow_runtime_pm = true,
++#endif
+ };
+ 
+ static const struct sdhci_ops sdhci_gl9750_ops = {

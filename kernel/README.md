@@ -1,10 +1,14 @@
 # kernel
 
 Patches for the Asahi Linux kernel: the panel backlight without visible
-steps, the PMP booted for lower idle power, and the ProMotion display's
-variable refresh rate (VRR) on. Plus appledrm options: VRR, and the full
+steps, the PMP booted for lower idle power, the ProMotion display's
+variable refresh rate (VRR) on, cores powered down for shorter idle
+periods, a Wi-Fi radio that sleeps sooner, and the SD card reader, the
+HDMI converter, the HDMI port's PHY and the USB-C ports powered down
+while nothing is plugged in, and the I2C buses between transfers. Plus appledrm options: VRR, and the full
 panel height around the notch. And a smaller kernel config, without the
-drivers this MacBook cannot use, so that a kernel build takes less time.
+drivers this MacBook cannot use, so that a kernel build takes less time,
+with three options on for fewer wakeups while the machine is idle.
 
 | File | What it is |
 |---|---|
@@ -12,17 +16,31 @@ drivers this MacBook cannot use, so that a kernel build takes less time.
 | [0002-drm-apple-backlight-without-blocking.patch](0002-drm-apple-backlight-without-blocking.patch) | A brightness write returns at once, and the brightness can change about 60 times a second instead of 21 |
 | [0003-arm64-dts-apple-j314s-boot-the-pmp.patch](0003-arm64-dts-apple-j314s-boot-the-pmp.patch) | Boots the Power Management Processor on the 14-inch M1 Pro (J314s) |
 | [0004-drm-apple-adaptive-sync-promotion.patch](0004-drm-apple-adaptive-sync-promotion.patch) | VRR for the ProMotion panel and Adaptive Sync monitors, behind `appledrm.force_vrr` |
+| [0005-cpuidle-apple-power-down-for-shorter-idle.patch](0005-cpuidle-apple-power-down-for-shorter-idle.patch) | A core is powered down for idle periods from 2 ms instead of 10 ms; adjustable while running |
+| [0006-wifi-brcmfmac-power-save-timeout.patch](0006-wifi-brcmfmac-power-save-timeout.patch) | In power save the Wi-Fi radio stays awake 200 ms after traffic instead of 2 s; adjustable while running |
+| [0007-mmc-sdhci-pci-gli-gl9755-runtime-pm.patch](0007-mmc-sdhci-pci-gli-gl9755-runtime-pm.patch) | The SD card reader can sleep while its slot is empty. Off until `sdhci_pci.gl9755_runtime_pm=1`, which unplugged.conf sets |
+| [0008-drm-apple-hdmi-converter-off-unplugged.patch](0008-drm-apple-hdmi-converter-off-unplugged.patch) | The HDMI port's converter chip can be switched off while no monitor is plugged in. Off until `appledrm.hdmi_idle_off=1`, which unplugged.conf sets |
+| [0009-usb-apple-typec-runtime-pm.patch](0009-usb-apple-typec-runtime-pm.patch) | A USB-C port's controller and PHY can be powered down while nothing is plugged into it. Off until the port's `power/control` is `auto`, which unplugged.rules makes it |
+| [0010-drm-apple-hdmi-phy-off-unplugged.patch](0010-drm-apple-hdmi-phy-off-unplugged.patch) | The HDMI port's PHY and the display crossbar in front of it can be released, and powered down, along with the converter. Off until `appledrm.hdmi_idle_phy_off=1`, which unplugged.conf sets |
+| [0011-i2c-apple-runtime-pm.patch](0011-i2c-apple-runtime-pm.patch) | An I2C bus's controller can be powered down between transfers. Off until the bus's `power/control` is `auto`, which unplugged.rules makes it |
 | [appledrm.conf](appledrm.conf) | Sets `appledrm.force_vrr=1` and `appledrm.show_notch=1` |
+| [unplugged.conf](unplugged.conf) | Module options that turn 0007, 0008 and 0010 on from boot |
+| [unplugged.rules](unplugged.rules) | udev rules that turn 0009 and 0011 on from boot, for the three USB-C ports and the four I2C buses, and allow the HDMI port's PHY and crossbar to sleep once 0010 releases them |
+| [unplugged-ab.sh](unplugged-ab.sh) | Measures what those save: flips them off and on in turns and compares the power draw |
 | [trim.config](trim.config) | A config fragment that turns off drivers for hardware this MacBook cannot take, kernel self-tests, and server parts |
+| [power.config](power.config) | A config fragment that turns on three options for fewer wakeups at idle: power-efficient workqueues, RCU callbacks in kernel threads, lazy RCU |
 | [required.txt](required.txt) | The options this Mac's own drivers need; a build stops before compiling if one is off |
-| [install.sh](install.sh) | Makes every Gentoo `asahi-kernel` build apply the patches and trim.config and check required.txt, and installs appledrm.conf |
+| [install.sh](install.sh) | Makes every Gentoo `asahi-kernel` build apply the patches, trim.config and power.config and check required.txt, and installs appledrm.conf, unplugged.conf and unplugged.rules |
 | [asahi-kernel.bashrc](asahi-kernel.bashrc) | The Portage hook that install.sh puts in place |
 
-Each patch works without the others. The backlight patches change only
+Each patch works without the others (0008 changes `dcp.c`, as 0004 does,
+in other places), except 0010: it adds to what 0008 put in `dcp.c`, and
+the PHY sleeps only with 0009. The backlight patches change only
 `drivers/gpu/drm/apple/dcp_backlight.c`, which serves the built-in panel
 only: external displays have no backlight device and are not affected.
 
-Written against `asahi-7.2.14-1` (Gentoo `sys-kernel/asahi-kernel-7.2.14_p1`).
+Written against `asahi-7.2.14-1` (Gentoo `sys-kernel/asahi-kernel-7.2.14_p1`);
+0005 to 0011 against `asahi-7.3.3-2` (`asahi-kernel-7.3.3_p2`).
 
 ## 1/64-nit backlight
 
@@ -322,6 +340,464 @@ PCI Ethernet drivers return. The likely ones:
 Without `/etc/kernel/config.d/wmutils-trim.config` the build has
 the full stock config again, until install.sh puts it back.
 
+## Cores powered down sooner
+
+The cpuidle driver has two states: `WFI`, where an idle core is
+clock-gated but stays powered, and `CPU PD`, where it is powered down
+and resumes where it stopped. `CPU PD` is left within 10 microseconds,
+but the driver asked for 10 ms of idle time before entering it, so the
+governor kept a core in `WFI` whenever its next timer, or the idle time
+it predicted, was under 10 ms. A core that a 120 Hz display (8.3 ms) or
+a short audio period wakes never powered down. On this machine, over
+three hours that included a long compile, the first efficiency core
+spent 5377 s in `WFI` and 3836 s in `CPU PD`, and 56 % of its `CPU PD`
+entries ended early.
+
+The patch asks for 2 ms. Entering the state costs the kernel's
+`cpu_pm_enter()` and `cpu_pm_exit()` and saving a few registers, so
+10 ms was far on the safe side; but where the state breaks even is not
+documented and has not been measured, and a value that is too low costs
+energy instead of saving it. So the patch also makes it a parameter,
+which takes effect at once:
+
+```sh
+cat /sys/module/cpuidle_apple/parameters/pd_residency_us        # 2000
+echo 10000 | sudo tee /sys/module/cpuidle_apple/parameters/pd_residency_us   # as before
+```
+
+`cpuidle_apple.pd_residency_us=10000` on the kernel command line does
+the same from boot. To compare two values, leave the machine alone with
+the screen at one brightness and average
+`/sys/class/power_supply/macsmc-battery/power_now` (microwatts, negative
+while discharging) over a few minutes with each. How much time each
+state gets is in `/sys/devices/system/cpu/cpu*/cpuidle/state*/time`.
+
+## Wi-Fi asleep sooner
+
+In power save the Broadcom firmware keeps the radio awake for a while
+after each frame (`pm2_sleep_ret`) before it sleeps until the next
+beacon. brcmfmac sets that time from cfg80211's timeout, limited to
+2000 ms; but cfg80211 passes -1 unless a timeout was asked for, which
+only the old wireless extensions can do, and the driver's limit turned
+-1 into the full 2000 ms. With a frame every second or two (broadcasts,
+keepalives) the radio hardly slept while connected.
+
+The patch uses 200 ms when no timeout was asked for. What that saves
+depends on the traffic and has not been measured. The cost is latency: a
+reply that comes more than 200 ms after the last frame waits for the
+next beacon, typically up to 100 ms. It is a parameter too, read
+whenever power save is set, which happens each time the interface comes
+up:
+
+```sh
+cat /sys/module/brcmfmac/parameters/ps_timeout_ms               # 200
+echo 2000 | sudo tee /sys/module/brcmfmac/parameters/ps_timeout_ms   # as before
+nmcli radio wifi off && nmcli radio wifi on                     # takes the interface down and up
+```
+
+Power save itself is NetworkManager's `wifi.powersave` setting; with it
+off (`2`) the radio never sleeps and the time does not matter.
+
+## Parts that sleep while nothing is plugged in
+
+The SD card reader, the HDMI port's converter chip and the three USB-C
+ports' controllers stay powered whether or not anything is plugged into
+them. Patches 0007, 0008 and 0009 let the kernel power each of them down
+while it is unused. They change how hardware is driven, and whether the
+hardware goes along (a wake-up signal that has to arrive from a part
+that is asleep) can only be found out on the machine. So in the kernel
+each one does nothing until it is switched on, and each switch works on
+a running system and can be switched back.
+
+`install.sh` switches all three on from boot, with
+[unplugged.conf](unplugged.conf) (the reader and the converter) and
+[unplugged.rules](unplugged.rules) (the ports). And two more, which
+work on this machine but saved nothing that could be measured: patch
+0010, which releases
+[the HDMI port's PHY](#the-hdmi-ports-phy-and-crossbar) along with the
+converter (unplugged.conf), and patch 0011, which has nothing to do
+with plugs: it lets [the I2C buses](#the-i2c-buses) sleep between
+transfers (unplugged.rules). After a boot:
+
+```sh
+cat /sys/module/sdhci_pci/parameters/gl9755_runtime_pm /sys/module/appledrm/parameters/hdmi_idle_off \
+    /sys/module/appledrm/parameters/hdmi_idle_phy_off                                                  # Y, three times
+cd /sys/bus/platform/devices
+cat 702280000.usb/power/control 703000000.phy/power/control b02280000.usb/power/control \
+    b03000000.phy/power/control f02280000.usb/power/control f03000000.phy/power/control                # auto, six times
+cat 39b040000.i2c/power/control 39b044000.i2c/power/control 39b048000.i2c/power/control \
+    39b04c000.i2c/power/control                                                                        # auto, four times
+```
+
+To leave one of them off, delete its option from unplugged.conf, or its
+names from unplugged.rules (or the whole rule), and run
+`sudo sh kernel/install.sh` again; a kernel build after that takes it
+out of the initramfs too.
+
+What has been seen on this machine (14-inch M1 Pro, `asahi-7.3.3-2`),
+with all three on and only the charger plugged in: the reader in D3hot,
+the converter powered down without coming back by itself, the three
+ports' controllers and PHYs suspended, and their power domains
+(`atc0_usb` to `atc2_usb`, `atc0_common` to `atc2_common`) off. What
+has not been tried with them on: plugging in a card, a monitor or a USB
+device, and a suspend and resume.
+
+Together they save about 0.67 W, 18 % of what this machine draws idle
+on battery with the panel at 2 nits and Wi-Fi connected: 3.64 W with
+the three switched off, 2.97 W with them on (medians over 10 pairs of
+50 s; every pair came out between 0.63 and 0.72 W). How much of that
+each of the three accounts for has not been measured. The reading of
+the whole machine's power moves by about 0.1 W by itself, and by more
+when something runs, so one reading before and one after show little.
+[unplugged-ab.sh](unplugged-ab.sh) flips the switches off and on in
+turns, a minute each, reads the SMC's "Total System Power" once a
+second, and gives the difference over the pairs with its standard
+error:
+
+```sh
+sudo sh kernel/unplugged-ab.sh                # 6 pairs of 60 s, all three
+sudo sh kernel/unplugged-ab.sh 10 60 usb      # 10 pairs, the USB-C ports only
+sudo sh kernel/unplugged-ab.sh 6 60 hdmiphy   # the HDMI port's PHY and crossbar only (0010)
+sudo sh kernel/unplugged-ab.sh 6 60 i2c       # the I2C buses only (0011)
+```
+
+Run it on battery with nothing plugged in, and leave the machine alone
+meanwhile. It puts every switch back where it was, also when stopped
+with Ctrl-C.
+
+When trying those, have nothing unsaved, and keep `sudo dmesg -w` open
+in a terminal. Each section below has the switch for a running system,
+what to look for, and the way back.
+
+### The SD card reader
+
+The reader is a Genesys GL9755 on its own PCIe port
+(`/sys/bus/pci/devices/0000:02:00.0`). sdhci-pci lets a reader sleep
+only if its part of the driver says it can, and the GL9755's did not, so
+writing `auto` to its `power/control` changed nothing. With the patch
+and the parameter on, the reader goes to sleep (PCI D3hot) while the
+slot is empty, with the controller's "wake on card insertion" set, so
+that putting a card in wakes it through a PCIe power management event.
+With a card in the slot it stays awake, as before, so
+reading and writing a card are not touched.
+
+```sh
+sudo modprobe -r sdhci_pci && sudo modprobe sdhci_pci gl9755_runtime_pm=1
+cat /sys/bus/pci/devices/0000:02:00.0/power/runtime_status      # suspended, with the slot empty
+```
+
+Put a card in: it has to show up in `lsblk` within a second or two, and
+the status reads `active`. Take it out (unmounted): `suspended` again.
+The open question is whether the wake-up arrives. The PCI core also
+looks for it once a second until it has seen the first real one, so a
+card that shows up only after a pause, or not at all, is the sign that
+it does not. The PCIe port above the reader (`0000:00:01.0`) may go to
+sleep too once the reader has; if cards are found only with
+`echo on | sudo tee /sys/bus/pci/devices/0000:00:01.0/power/control`,
+the wake-up does not get through a sleeping port.
+
+Back to how it was: `echo on | sudo tee
+/sys/bus/pci/devices/0000:02:00.0/power/control`, or load the module
+again without the parameter. unplugged.conf sets the parameter at boot.
+
+### The HDMI converter
+
+The HDMI port is fed by a DisplayPort-to-HDMI converter chip, which the
+driver powers up when it starts and never powers down. With
+`hdmi_idle_off` on, the driver switches the converter off three seconds
+after it finds the port empty and no picture going to it. When the
+port's hot-plug line rises it switches the converter on, gives it
+`hdmi_boot_ms` (500 ms) to start, and brings the link up as before. The
+5 V supply of the port stays on. The port's PHY is the next section's.
+
+```sh
+echo 1 | sudo tee /sys/module/appledrm/parameters/hdmi_idle_off
+```
+
+With the port empty, `dmesg` says `DP2HDMI powered down` right away.
+Plug a monitor in: `DP2HDMI powered up`, then the monitor comes up as it
+always did, and `cat /sys/class/drm/card*-HDMI-A-1/status` reads
+`connected`. Unplug it: `powered down` again, once, about three seconds
+later. Try it a few times, and across a suspend.
+
+The open question is whether the hot-plug line still reaches the SoC
+while the converter has no power. If it does not, a monitor is simply
+not noticed; if the line floats, the two messages repeat every few
+seconds. Either way:
+
+```sh
+echo 0 | sudo tee /sys/module/appledrm/parameters/hdmi_idle_off
+```
+
+powers the converter up at once and leaves it up, as without the patch.
+If a monitor is noticed but stays black the first time, the converter
+may need longer to start: `echo 1000 | sudo tee
+/sys/module/appledrm/parameters/hdmi_boot_ms` (up to 5000).
+unplugged.conf sets `hdmi_idle_off` at boot; appledrm loads in the
+initramfs, so a change to it counts from the next kernel build on.
+
+### The HDMI port's PHY and crossbar
+
+Behind the converter the port is a DisplayPort output of the SoC. Three
+parts make it: a display coprocessor of its own (`289c00000.dcp`), the
+display crossbar (`130304c000.mux`), which connects a coprocessor to a
+PHY, and the fourth Type-C PHY (`1303000000.phy`), which drives the
+lines to the converter. The driver connects the crossbar and switches
+the PHY to DisplayPort when it starts and leaves them so, monitor or
+not: the PHY is always in use, and the power domain the two share
+(`atc3_usb`) never goes off.
+
+With `hdmi_idle_phy_off` on as well as `hdmi_idle_off`, the driver
+releases them where it powers the converter down: it switches the PHY
+off and disconnects the crossbar. Both can then sleep, and their power
+domain goes off. When the hot-plug line rises it connects the crossbar
+and switches the PHY to DisplayPort again, before the converter gets
+its power. The crossbar had no runtime power management; with the patch
+it has, and it sets itself up again after sleeping the way its probe
+does.
+
+The coprocessor keeps running. Its power domain is marked always-on in
+the device tree, and the driver has no way to shut a coprocessor down
+and start it again (its own comment at suspend: "we do not support full
+shutdown properly yet"). With no monitor it is told to power its
+display pipeline off, which it was before the patch too.
+
+`install.sh` switches this one on too, with unplugged.conf. On this
+machine it does what it says and saves nothing that could be measured:
+with the parameter on
+both devices were `suspended` in every half of a run of
+`unplugged-ab.sh 6 60 hdmiphy`, and by the medians of five pairs the
+machine drew 0.03 W more with it on than with it off, give or take 0.02
+(at 4.2 W, with the panel at 125 nits; the first pair, three minutes
+after a boot with the CPU still busy, is left out). The domain above
+theirs (`atc3_common`) is always-on in the device tree and stays on.
+No monitor has been plugged in with it on. unplugged.rules allows the two devices to
+sleep, which changes nothing while they are in use. By hand, with nothing in
+the HDMI port, nothing unsaved and `sudo dmesg -w` open:
+
+```sh
+cat /sys/bus/platform/devices/1303000000.phy/power/control /sys/bus/platform/devices/130304c000.mux/power/control   # auto, auto
+sync; echo 1 | sudo tee /sys/module/appledrm/parameters/hdmi_idle_phy_off
+cat /sys/bus/platform/devices/1303000000.phy/power/runtime_status /sys/bus/platform/devices/130304c000.mux/power/runtime_status   # suspended, suspended, a second or two later
+```
+
+`dmesg` says `Switched dpphy to disconnected state` and `DP path
+released`. Plug a monitor in: `Switched dpphy to dispext0,0`, `DP path
+connected`, `DP2HDMI powered up`, and the monitor comes up as it always
+did. Unplug it: both messages of the release again, three seconds
+later, and both statuses back to `suspended`.
+
+What can go wrong: the coprocessor has not been seen to run with its
+output disconnected. If it minds, `dmesg` says `DCP has crashed`, and
+the HDMI port is dead until a reboot (the built-in panel has its own
+coprocessor). A monitor that stays black after `DP path connected` says
+that the link does not come up again from a PHY that was off. Either
+way:
+
+```sh
+echo 0 | sudo tee /sys/module/appledrm/parameters/hdmi_idle_phy_off
+```
+
+connects both again at once and leaves them so, as without the patch.
+To leave it off from boot, take `hdmi_idle_phy_off=1` out of the
+`appledrm` line of unplugged.conf and run `sudo sh kernel/install.sh`
+again; a kernel build after that takes it out of the initramfs too.
+
+### The USB-C ports
+
+Each USB-C port has a dwc3 USB controller and a Type-C PHY (atcphy).
+Neither driver had runtime power management, and the kernel keeps the
+power domain of such a device on for good. With the patch both have it:
+the controller counts as in use from the moment a cable is plugged in
+until it is pulled out, the PHY whenever it is in any other state than
+the one it starts in, and when both are idle their power domains can be
+switched off. Waking the PHY sets it up again the way its probe does. A
+port with something in it is driven exactly as before.
+
+This is the patch that can go wrong the hardest: a register access to a
+part without power stops the machine on the spot. So the drivers start
+with it forbidden (`power/control` reads `on`) until it is allowed, one
+port at a time, which is what unplugged.rules does at boot:
+
+```sh
+cd /sys/bus/platform/devices
+echo auto | sudo tee 702280000.usb/power/control 703000000.phy/power/control
+cat 702280000.usb/power/runtime_status 703000000.phy/power/runtime_status   # suspended, about a second later
+```
+
+Then, on that port: a USB 2 device (keyboard, mouse), a USB 3 device (a
+disk; `lsusb -t` shows 5000M or more), the charger, a hub, a display or
+dock if you use one, each plugged in and pulled out a few times and in
+both orientations, and a suspend and resume with and without a device
+in it. After each unplug both statuses have to return to `suspended`.
+`echo on` into the same two files puts the port back as it was, also
+while it is asleep.
+
+| Port | Controller | PHY |
+|---|---|---|
+| First | `702280000.usb` | `703000000.phy` |
+| Second | `b02280000.usb` | `b03000000.phy` |
+| Third | `f02280000.usb` | `f03000000.phy` |
+
+Which socket is which shows when a device is plugged in: that port's
+controller turns `active`. `1303000000.phy` is the fourth PHY, which
+feeds the HDMI converter; it is in use, and awake, for as long as
+[`hdmi_idle_phy_off`](#the-hdmi-ports-phy-and-crossbar) has not
+released it. Whether the domains really go off is in
+`sudo grep atc /sys/kernel/debug/pm_genpd/pm_genpd_summary`.
+
+### The I2C buses
+
+Four I2C buses are in use on this machine, each with a controller of
+its own in the SoC and a power domain of its own (`i2c0` to `i2c3`):
+
+| Bus | Controller | What is on it |
+|---|---|---|
+| First | `39b040000.i2c` | The four USB-C port controllers (cd321x) |
+| Second | `39b044000.i2c` | Three speaker amplifiers (tas2764) |
+| Third | `39b048000.i2c` | The headphone codec (cs42l84) |
+| Fourth | `39b04c000.i2c` | The other three speaker amplifiers |
+
+Those chips are written to when a cable goes in or a stream starts, and
+otherwise not: while the machine sits idle the interrupt counts of the
+four buses do not move. The controller's driver had no runtime power management, so
+all four domains were on for good. With the patch a controller is awake
+for a transfer and 100 ms after it, and its domain can go off in
+between. Waking it sets it up again the way its probe does. Around a
+system sleep it is kept awake from its own suspend callback to its
+resume callback, so that the chips' drivers can reach them in all of
+theirs.
+
+This is not about plugs, and it has no part in the 0.67 W above. On
+this machine it works and saves nothing that could be measured: with
+`auto` all four buses were `suspended` through every half of a run of
+`unplugged-ab.sh 6 60 i2c`, with not one transfer in twelve minutes,
+and by the medians of the four middle pairs the machine drew 0.05 W
+more with them asleep than awake, give or take 0.02 (at 6.1 W, with
+about 4 % of the CPU in use throughout; the first and the last pair,
+with bursts to 8 W and more in one half, are left out). The four
+domains are small ones, at the end of the tree, and the domain above
+them (`sio`) stays on for the keyboard and the trackpad. Like the USB-C
+ports it starts forbidden (`power/control` reads `on`), until
+unplugged.rules allows it at boot. Sound, the headphone jack, the ports
+and a suspend have not been tried with it on. By hand, with nothing
+unsaved and `sudo dmesg -w` open:
+
+```sh
+cd /sys/bus/platform/devices
+sync; echo auto | sudo tee 39b040000.i2c/power/control 39b044000.i2c/power/control 39b048000.i2c/power/control 39b04c000.i2c/power/control
+cat 39b040000.i2c/power/runtime_status 39b044000.i2c/power/runtime_status 39b048000.i2c/power/runtime_status 39b04c000.i2c/power/runtime_status   # suspended, four times
+```
+
+Then: sound from the speakers, started and stopped a few times;
+headphones plugged in and pulled out, and sound through them; the
+charger and a USB device plugged in and pulled out; a suspend and
+resume, and all of that once more after it. A bus turns `active` for a
+moment each time and has to return to `suspended`. What can go wrong: a
+controller that does not answer after waking. `dmesg` then has I2C
+errors from `i2c-apple`, `tas2764`, `cs42l84` or `tps6598x`, and there
+is no sound, or a port does not notice its cable. `echo on` into the
+same four files keeps the controllers awake again, as without the
+patch. To leave it off from boot, delete the third rule of
+unplugged.rules and run `sudo sh kernel/install.sh` again.
+
+### What stays powered
+
+Looked at for the same treatment, and left as they are:
+
+- Audio. The driver of the I2S ports (`apple-mca`) already powers each
+  port's domain for the length of a stream. What stays on at idle is
+  the domain above them (`audio_p`), which the SIO coprocessor needs as
+  well; the audio DMA controller (`apple-admac`, domain `sio_adma`); and
+  the I2S port of the speakers' sense lines. That last one is held by a
+  stream, not by a missing callback: speakersafetyd, which keeps the
+  speakers from overheating, has the "Speaker Sense" capture stream open
+  and running for as long as it lives, and the DMA controller has a
+  channel started for it. Runtime PM in the DMA controller would
+  therefore never find it idle. Letting that stream lose its clock and
+  power while nothing plays means changing how the sound card starts
+  and stops the sense path against the playback path, and a mistake
+  there puts the sense data, which the speaker protection works from,
+  out of step. Not done without first knowing what it would save.
+- GPIO. Of the four pin controllers only `39b028000.pinctrl` has a power
+  domain that can be switched (`gpio`), and it delivers the interrupts
+  of the keyboard and trackpad, the HDMI hot-plug line, the headphone
+  codec, the USB-C port controllers and the speaker amplifiers. Something
+  is always waiting on it. `2921f0000.pinctrl` is in `nub_gpio`, which
+  the device tree marks always-on; the other two have no power domain.
+- The SMC (`290400000.smc`) and its mailbox have no power domain: there
+  is nothing to switch.
+- The SSD. Its controller is a coprocessor of the SoC (ANS2), and the
+  driver (`nvme-apple`) offers none of NVMe's own power states (no
+  APST). The one way it has of powering the SSD down is that of a
+  system sleep: an NVMe shutdown, then a shutdown of the coprocessor,
+  and on the way back a reset and a fresh boot of the coprocessor. The
+  driver says of that boot that there is no known way to recover if it
+  fails. With the root filesystem on it and something written every few
+  seconds, doing that whenever the SSD has been idle for a while would
+  rarely last long enough to save anything, and the failure it risks is
+  the root filesystem gone until a reboot.
+- The GPU (`406400000.gpu`, domain `gfx`, with `afr` above it). The
+  driver (`asahi`) has no runtime PM, and the part that draws power does
+  not wait for one: the GPU's firmware switches the GPU off by itself
+  once it has been idle for the delay the driver hands it, and the driver
+  hands it 2 ms (`idle_off_delay_ms` in `gpu.rs`). The driver's share is
+  one message that wakes the firmware when there is work. Switching
+  `gfx` off from the kernel would mean shutting that firmware down and
+  booting it again, and building anew everything the driver shares with
+  it, under the programs that are drawing. The driver has no shutdown
+  path (its RTKit binding can boot and wake a coprocessor, not stop
+  one).
+- The SIO coprocessor (`39bc00000.sio`, domain `sio_cpu`, which in turn
+  holds `spi_p` and `uart_p`). Its one user here is sound over HDMI. The
+  driver (`apple-sio`) suspends the device whenever no such sound plays,
+  but its suspend callback is empty (a TODO in the source), so the
+  firmware keeps running and its mailbox (`39bc08000.mbox`) stays awake.
+  Shutting the firmware down there would let the mailbox sleep and still
+  not the domain: the two IOMMUs in it (`39b004000.iommu`,
+  `39b008000.iommu`) also serve the audio DMA controller, which never
+  rests (see Audio above). What is left to save is an idle coprocessor
+  inside a domain that stays powered, against sound over HDMI gone until
+  a reboot if this firmware does not boot a second time, which the
+  driver has never asked of it. Not done.
+
+## Fewer wakeups at idle
+
+A CPU core that nothing wakes is powered down (the `CPU PD` state in
+`/sys/devices/system/cpu/cpu0/cpuidle`), so an idle machine saves power by
+being woken less often. [power.config](power.config) is a second config
+fragment, merged like trim.config, that turns on three options the stock
+config leaves off:
+
+| Option | What changes |
+|---|---|
+| `CONFIG_WQ_POWER_EFFICIENT_DEFAULT` | Work items on the kernel's "power efficient" workqueues run on a CPU that is awake instead of waking the one that queued them. The same as booting with `workqueue.power_efficient=1` |
+| `CONFIG_RCU_NOCB_CPU_DEFAULT_ALL` | RCU callbacks run in kernel threads (`rcuop/N`), which the scheduler places on a CPU that is awake, instead of in each CPU's softirq. The same as booting with `rcu_nocbs=all`; lazy RCU works only this way |
+| `CONFIG_RCU_LAZY` | RCU callbacks that are in no hurry wait up to ten seconds to share a grace period, instead of each starting one at once. Memory pressure or a long callback list ends the wait early |
+
+They are generic kernel code, written for battery-powered devices (lazy
+RCU came from ChromeOS and Android), and touch no Apple driver. Merged
+into the config of 7.3.3_p2 the way the ebuild merges it, the fragment
+changes these three options and nothing else, and every option in
+required.txt keeps its value. What they save on this machine has not been
+measured. Under load they cost a little: an unbound work item or an
+offloaded callback can run on another CPU than the one whose cache has its
+data.
+
+After booting a kernel with it:
+
+```sh
+cat /sys/module/workqueue/parameters/power_efficient   # Y
+zcat /proc/config.gz | grep -E 'RCU_LAZY|RCU_NOCB_CPU_DEFAULT_ALL'
+pgrep -c rcuop                                         # 8, one per CPU
+```
+
+To boot once without the first or the third, add
+`workqueue.power_efficient=0` or `rcutree.enable_rcu_lazy=0` to the kernel
+command line. To drop an option for good, delete its line from
+power.config and run `sudo sh kernel/install.sh` again; the next build has
+the stock value.
+
 ## Applying them automatically on Gentoo
 
 ```sh
@@ -332,17 +808,21 @@ sudo emerge --oneshot sys-kernel/asahi-kernel   # now, or wait for the next upda
 and reboot. `install.sh` puts the patches and required.txt in
 `/usr/local/share/wmutils` (removing any patch there that left the
 series), a Portage hook in `/etc/portage/env/sys-kernel/asahi-kernel`,
-trim.config in `/etc/kernel/config.d/wmutils-trim.config`, and
-appledrm.conf in `/etc/modprobe.d/wmutils-appledrm.conf`. The
-kernel build's dracut run copies that into the initramfs, where appledrm
-is loaded, and its m1n1 hook puts the new DTB in the boot loader.
+trim.config and power.config in `/etc/kernel/config.d` (as
+`wmutils-trim.config` and `wmutils-power.config`),
+appledrm.conf and unplugged.conf in `/etc/modprobe.d` (as
+`wmutils-appledrm.conf` and `wmutils-unplugged.conf`), and
+unplugged.rules in `/etc/udev/rules.d/60-wmutils-unplugged.rules`. The
+kernel build's dracut run copies those three into the initramfs, where
+appledrm and the USB-C drivers are loaded, and its m1n1 hook puts the
+new DTB in the boot loader.
 From then on every `asahi-kernel` build, kernel updates included, runs the
 hook after the kernel's own patches. For each patch in turn it applies the
 patch if it fits, skips it if the source already has it, and otherwise
 warns and builds without it. A kernel update therefore never fails because
 of a patch; a plain `/etc/portage/patches` entry would stop the build
 instead, so `install.sh` removes one if it finds it. The ebuild merges
-trim.config into the config, and once it is final the hook checks it
+trim.config and power.config into the config, and once it is final the hook checks it
 against required.txt (see [When a new kernel comes](#when-a-new-kernel-comes)).
 `install.sh` will not overwrite a hook file it did not write. Run it again
 after anything in this directory changes. `sudo sh kernel/install.sh
@@ -352,10 +832,33 @@ If a build warns that a patch no longer fits, that patch is missing until it
 is updated: without 0001 the backlight counts whole nits (and
 [autobrightd](../autobrightd) shows 1-nit steps), without 0002 brightness
 changes are back to about 21 updates a second, without 0003 the PMP stays
-off, and without 0004 the display runs at a fixed rate (appledrm then
-ignores `force_vrr` with a warning in `dmesg`). A kernel that already has
+off, without 0004 the display runs at a fixed rate (appledrm then
+ignores `force_vrr` with a warning in `dmesg`), without 0005 a core
+powers down only for idle periods of 10 ms and more, and without 0006
+the Wi-Fi radio stays awake 2 s after traffic (the two parameters are
+then missing from `/sys/module`). Without 0007, 0008, 0009, 0010 or 0011 that
+part stays powered as it does today, and its switch is missing or, for
+the USB-C ports and the I2C buses, `runtime_status` reads `unsupported`. A kernel that already has
 a patch's change is detected and the patch skipped, so once the Asahi
 kernel ships VRR or turns the PMP on, nothing breaks.
 
-The patches change files licensed GPL-2.0-only OR MIT (the devicetree:
-GPL-2.0+ OR MIT) and are under the same terms.
+The patches are changes to the Linux kernel, not part of this
+repository's GPL-3.0-or-later code, and each is under the license of
+the files it changes (the `SPDX-License-Identifier` line at the top of
+each):
+
+| Patch | Files | License |
+|---|---|---|
+| 0001, 0002, 0004, 0008, 0010 | `drivers/gpu/drm/apple/` | GPL-2.0-only OR MIT |
+| 0003 | the devicetree | GPL-2.0+ OR MIT |
+| 0005 | `drivers/cpuidle/cpuidle-apple.c` | GPL-2.0-only OR MIT |
+| 0006 | brcmfmac's `cfg80211.c` | ISC |
+| 0007 | `drivers/mmc/host/sdhci-pci-gli.c` | GPL-2.0+ |
+| 0009 | `drivers/phy/apple/atc.c` | GPL-2.0 OR BSD-2-Clause |
+| 0009 | `drivers/usb/dwc3/dwc3-apple.c` | GPL-2.0 |
+| 0010 | `drivers/mux/apple-display-crossbar.c` | GPL-2.0-only OR MIT |
+| 0011 | `drivers/i2c/busses/i2c-pasemi-*` | GPL-2.0-only |
+
+They were written from the kernel's own source and the public SD Host
+Controller specification only; nothing in them comes from macOS or any
+other Apple code.

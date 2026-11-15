@@ -1,0 +1,66 @@
+From: kkw537 <171009921+kkw537@users.noreply.github.com>
+Subject: [PATCH] wifi: brcmfmac: 200 ms awake after traffic in power save,
+ not 2 s
+
+In power save the driver uses PM_FAST: after a frame the radio stays
+awake for pm2_sleep_ret milliseconds before it sleeps again.
+brcmf_cfg80211_set_power_mgmt() sets that from cfg80211's timeout,
+limited to 2000 ms with min_t(u32, ...). But cfg80211 passes -1 unless a
+timeout was asked for, which only the wireless extensions can do
+(nl80211 has no attribute for it), and -1 as a u32 is over the limit. So
+every time power save is switched on, and every time the interface
+comes up, the firmware is told to stay awake for two seconds after each
+frame. With a frame every second or two (broadcasts, keepalives) the
+radio then hardly sleeps while connected.
+
+Use 200 ms when no timeout was asked for, and make it a parameter:
+
+  /sys/module/brcmfmac/parameters/ps_timeout_ms
+
+read whenever power save is set, so a new value takes effect the next
+time the interface comes up or power save is switched. 2000 gives the
+old behaviour back. A timeout that is asked for is passed on as before.
+
+What it saves depends on the traffic and has not been measured. The
+cost is latency: a reply that arrives more than 200 ms after the last
+frame waits for the next beacon.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/cfg80211.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/cfg80211.c
+@@ -88,6 +88,19 @@
+ #define BRCMF_ND_INFO_TIMEOUT		msecs_to_jiffies(2000)
+ 
+ #define BRCMF_PS_MAX_TIMEOUT_MS		2000
++#define BRCMF_PS_DEFAULT_TIMEOUT_MS	200
++
++/*
++ * In power save, how long the radio stays awake after the last frame before
++ * it sleeps again (the firmware's pm2_sleep_ret), when cfg80211 asks for no
++ * particular time. Read whenever power save is set, so a change in
++ * /sys/module/brcmfmac/parameters/ps_timeout_ms takes effect the next time
++ * the interface comes up or power save is switched.
++ */
++static unsigned int brcmf_ps_timeout_ms = BRCMF_PS_DEFAULT_TIMEOUT_MS;
++module_param_named(ps_timeout_ms, brcmf_ps_timeout_ms, uint, 0644);
++MODULE_PARM_DESC(ps_timeout_ms,
++		 "Time awake after traffic in power save (ms, up to 2000)");
+ 
+ /* Dump obss definitions */
+ #define ACS_MSRMNT_DELAY		80
+@@ -3204,6 +3217,14 @@
+ 			bphy_err(drvr, "error (%d)\n", err);
+ 	}
+ 
++	/*
++	 * cfg80211 passes -1 unless a time was asked for (which only the
++	 * wireless extensions can do). As a u32 that was the maximum: two
++	 * seconds awake after every frame.
++	 */
++	if (timeout < 0)
++		timeout = brcmf_ps_timeout_ms;
++
+ 	err = brcmf_fil_iovar_int_set(ifp, "pm2_sleep_ret",
+ 				min_t(u32, timeout, BRCMF_PS_MAX_TIMEOUT_MS));
+ 	if (err)
