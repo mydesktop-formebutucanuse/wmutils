@@ -5,8 +5,7 @@ steps, the PMP booted for lower idle power, the ProMotion display's
 variable refresh rate (VRR) on, cores powered down for shorter idle
 periods, a Wi-Fi radio that sleeps sooner, and the SD card reader, the
 HDMI converter, the HDMI port's PHY and the USB-C ports powered down
-while nothing is plugged in, the I2C buses between transfers, and a switch
-that reads the keyboard and trackpad without interrupts. Plus appledrm options: VRR, and the full
+while nothing is plugged in, and the I2C buses between transfers. Plus appledrm options: VRR, and the full
 panel height around the notch. And a smaller kernel config, without the
 drivers this MacBook cannot use, so that a kernel build takes less time,
 with three options on for fewer wakeups while the machine is idle.
@@ -24,12 +23,10 @@ with three options on for fewer wakeups while the machine is idle.
 | [0009-usb-apple-typec-runtime-pm.patch](0009-usb-apple-typec-runtime-pm.patch) | A USB-C port's controller and PHY can be powered down while nothing is plugged into it. Off until the port's `power/control` is `auto`, which unplugged.rules makes it |
 | [0010-drm-apple-hdmi-phy-off-unplugged.patch](0010-drm-apple-hdmi-phy-off-unplugged.patch) | The HDMI port's PHY and the display crossbar in front of it can be released, and powered down, along with the converter. Off until `appledrm.hdmi_idle_phy_off=1`, which unplugged.conf sets |
 | [0011-i2c-apple-runtime-pm.patch](0011-i2c-apple-runtime-pm.patch) | An I2C bus's controller can be powered down between transfers. Off until the bus's `power/control` is `auto`, which unplugged.rules makes it |
-| [0012-spi-apple-poll-threshold.patch](0012-spi-apple-poll-threshold.patch) | The SPI driver's polling threshold becomes a parameter, `spi_apple.poll_us`; at 8 the keyboard and trackpad are polled instead of read by sixteen interrupts a packet. At its default (5) nothing changes |
 | [appledrm.conf](appledrm.conf) | Sets `appledrm.force_vrr=1` and `appledrm.show_notch=1` |
 | [unplugged.conf](unplugged.conf) | Module options that turn 0007, 0008 and 0010 on from boot |
 | [unplugged.rules](unplugged.rules) | udev rules that turn 0009 and 0011 on from boot, for the three USB-C ports and the four I2C buses, and allow the HDMI port's PHY and crossbar to sleep once 0010 releases them |
 | [unplugged-ab.sh](unplugged-ab.sh) | Measures what those save: flips them off and on in turns and compares the power draw |
-| [trackpad-ab.sh](trackpad-ab.sh) | Measures 0012 with a finger on the trackpad: interrupts and polling in turns, with the interrupts, wakeups and power draw of each |
 | [trim.config](trim.config) | A config fragment that turns off drivers for hardware this MacBook cannot take, kernel self-tests, and server parts |
 | [power.config](power.config) | A config fragment that turns on three options for fewer wakeups at idle: power-efficient workqueues, RCU callbacks in kernel threads, lazy RCU |
 | [required.txt](required.txt) | The options this Mac's own drivers need; a build stops before compiling if one is off |
@@ -43,7 +40,7 @@ the PHY sleeps only with 0009. The backlight patches change only
 only: external displays have no backlight device and are not affected.
 
 Written against `asahi-7.2.14-1` (Gentoo `sys-kernel/asahi-kernel-7.2.14_p1`);
-0005 to 0012 against `asahi-7.3.3-2` (`asahi-kernel-7.3.3_p2`).
+0005 to 0011 against `asahi-7.3.3-2` (`asahi-kernel-7.3.3_p2`).
 
 ## 1/64-nit backlight
 
@@ -801,7 +798,7 @@ command line. To drop an option for good, delete its line from
 power.config and run `sudo sh kernel/install.sh` again; the next build has
 the stock value.
 
-## The trackpad without interrupts
+## Interrupts and the performance cores
 
 Where the interrupts of the devices go was counted over a minute each
 (`/proc/interrupts`), with the performance cores in mind: an idle one is
@@ -822,41 +819,16 @@ They cannot be told where to go. The interrupt controller of this SoC
 (AIC2) picks the core itself: its driver has no affinity setting, so
 `/proc/irq/N/smp_affinity` cannot be written, and the kernel does not
 let the thread of an interrupt handler be moved (it is bound, and
-`taskset` is refused). What can be changed is how many there are.
+`taskset` is refused).
 
 The trackpad sent 63 packets a second, so each took 16 interrupts. A
 packet is 256 bytes; the controller's FIFO holds 16; and the driver
 (`spi-apple`) sleeps until an interrupt for every wait it reckons longer
 than 5 us. At the 8 MHz of this bus half a FIFO takes 8 us, so it
-sleeps, sixteen times a packet, for a few microseconds each. The flash
-chip on the other SPI bus runs at 25 MHz and is polled already.
-
-[0012](0012-spi-apple-poll-threshold.patch) makes the 5 us a parameter.
-At 8 the keyboard and trackpad are polled: the thread that reads a
-packet stays on its core for the 256 us the packet is on the wire, and
-the SPI controller raises no interrupt. That is a trade, not a plain
-gain. The thread used 192 us of CPU time a packet with the interrupts
-and will use the 256 us and more when polling; what goes away is the
-interrupts and a core's going idle and being woken sixteen times a
-packet. Which draws less has not been measured, and the patch has not
-yet been booted.
-
-With a kernel that has it:
-
-```sh
-cat /sys/module/spi_apple/parameters/poll_us              # 5
-echo 8 | sudo tee /sys/module/spi_apple/parameters/poll_us
-grep 39b10c000.spi /proc/interrupts    # no longer counts while you type or point
-sudo sh kernel/trackpad-ab.sh          # 4 pairs of 20 s: keep a finger circling
-```
-
-`trackpad-ab.sh` switches between 5 and 8 in turns and prints for each
-half the packets, the SPI interrupts and the share of them on the
-performance cores, the reading thread's sleeps, how often the
-performance and the efficiency cores went idle, and the power draw
-(`Total System Power`). The finger is the load, so its evenness is the
-measurement's: the packets column says how even it was. Nothing sets
-the parameter at boot; it is back at 5 after a reboot.
+sleeps, sixteen times a packet, for a few microseconds each. Left as it
+is: polling a packet instead would keep a core busy for the 256 us the
+packet is on the wire, and whether that draws less than the interrupts
+has not been measured.
 
 ## Applying them automatically on Gentoo
 
@@ -898,8 +870,7 @@ powers down only for idle periods of 10 ms and more, and without 0006
 the Wi-Fi radio stays awake 2 s after traffic (the two parameters are
 then missing from `/sys/module`). Without 0007, 0008, 0009, 0010 or 0011 that
 part stays powered as it does today, and its switch is missing or, for
-the USB-C ports and the I2C buses, `runtime_status` reads `unsupported`.
-Without 0012 `/sys/module/spi_apple/parameters/poll_us` is missing. A kernel that already has
+the USB-C ports and the I2C buses, `runtime_status` reads `unsupported`. A kernel that already has
 a patch's change is detected and the patch skipped, so once the Asahi
 kernel ships VRR or turns the PMP on, nothing breaks.
 
@@ -919,7 +890,6 @@ each):
 | 0009 | `drivers/usb/dwc3/dwc3-apple.c` | GPL-2.0 |
 | 0010 | `drivers/mux/apple-display-crossbar.c` | GPL-2.0-only OR MIT |
 | 0011 | `drivers/i2c/busses/i2c-pasemi-*` | GPL-2.0-only |
-| 0012 | `drivers/spi/spi-apple.c` | GPL-2.0 |
 
 They were written from the kernel's own source and the public SD Host
 Controller specification only; nothing in them comes from macOS or any
