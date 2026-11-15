@@ -798,38 +798,6 @@ command line. To drop an option for good, delete its line from
 power.config and run `sudo sh kernel/install.sh` again; the next build has
 the stock value.
 
-## Interrupts and the performance cores
-
-Where the interrupts of the devices go was counted over a minute each
-(`/proc/interrupts`), with the performance cores in mind: an idle one is
-powered down, and an interrupt wakes it.
-
-| The machine | Device interrupts a second | Of them on the two efficiency cores |
-|---|---|---|
-| Left alone | 34 | 94 % |
-| A program redrawing, nothing touched | 327 | 96 % |
-| A finger moving on the trackpad | 1237 | 49 % |
-
-With the finger on the trackpad, 1007 of the 1237 were the SPI
-controller's that the keyboard and trackpad hang on (`39b10c000.spi`),
-and 54 % of those went to one performance core, which went idle and was
-woken again about 1600 times a second.
-
-They cannot be told where to go. The interrupt controller of this SoC
-(AIC2) picks the core itself: its driver has no affinity setting, so
-`/proc/irq/N/smp_affinity` cannot be written, and the kernel does not
-let the thread of an interrupt handler be moved (it is bound, and
-`taskset` is refused).
-
-The trackpad sent 63 packets a second, so each took 16 interrupts. A
-packet is 256 bytes; the controller's FIFO holds 16; and the driver
-(`spi-apple`) sleeps until an interrupt for every wait it reckons longer
-than 5 us. At the 8 MHz of this bus half a FIFO takes 8 us, so it
-sleeps, sixteen times a packet, for a few microseconds each. Left as it
-is: polling a packet instead would keep a core busy for the 256 us the
-packet is on the wire, and whether that draws less than the interrupts
-has not been measured.
-
 ## Applying them automatically on Gentoo
 
 ```sh
