@@ -1,18 +1,20 @@
 # selinux
 
-Brings SELinux up on this Gentoo in permissive mode, one step at a time:
+Brings SELinux up on this Gentoo, one step at a time. First permissive:
 the kernel loads a policy, s6's init, the services and the logins run in
 the policy's domains, and the kernel logs what the policy would refuse and
-refuses nothing. Enforcing mode is not a step here (see
-[Not enforcing](#not-enforcing)).
+refuses nothing. Then enforcing, from a point in the boot from which there
+is a way back (see [What enforcing covers](#what-enforcing-covers)).
 
 | File | What it is |
 |---|---|
-| [install.sh](install.sh) | The steps: `status`, `profile`, `packages`, `boot`, `relabel`, `s6`, `s6-undo`, `remove` |
+| [install.sh](install.sh) | The steps: `status`, `profile`, `packages`, `boot`, `relabel`, `s6`, `policy`, `denials`, `enforcing`, their `-undo`, `remove` |
 | [make.defaults](make.defaults) | For the Portage profile: one policy store, `mcs` |
 | [dracut.conf](dracut.conf) | Has the initramfs load the policy |
 | [selinuxfs.start](selinuxfs.start) | Mounts selinuxfs at every boot, from `/etc/local.d` |
 | [rc.selinux](rc.selinux) | Run first by s6-linux-init's `rc.init`: mounts selinuxfs and labels `/run` and `/dev` before any service starts |
+| [wmutils_s6.te](wmutils_s6.te) | A policy module: what s6 needs and the types borrowed for it do not allow |
+| [enforcing.start](enforcing.start) | Switches to enforcing at every boot, from `/etc/local.d`, unless the boot before it went enforcing and nobody got in |
 
 Written for Gentoo's `default/linux/arm64/23.0/desktop` profile,
 asahi-kernel 7.2.14, dracut 112 with a UKI, s6-linux-init and s6-rc, and
@@ -23,8 +25,11 @@ with SELinux on, permissive, with the policy loaded and every file
 labelled. The world update ran after the reboot here, not before `boot`;
 both orders work. `remove` has only run on a copy of `/etc`.
 
-**Step 7, the one for s6, has not run on it yet**, nor been through a
-boot. It was tried without root, on copies; the step says how.
+**Step 7, the one for s6, ran on 2026-11-16** and has been through two
+boots: init, the services and the logins run in the policy's domains.
+
+**Steps 8 and 9, the policy module and enforcing, have not run on it
+yet.** They were tried without root; each step says how.
 
 ## How it was
 
@@ -246,30 +251,163 @@ What was tried, without root, on 2026-11-11:
   as those daemons are. From `local_login_t` the policy's default context
   for the user is `unconfined_t`.
 
-Not tried: the real `semanage` with these contexts, the step as root, and
-a boot.
+On 2026-11-16 the step ran as root, with the real `semanage`, and the
+machine booted with it, twice. What `ps -eo label,args` showed:
+
+- process 1 (`s6-svscan`) is `init_t`, and only kernel threads are left in
+  `kernel_t`;
+- `s6-supervise`, `s6-log`, s6-rc's own services, `speakersafetyd` and
+  `rclone` are `initrc_t`;
+- `NetworkManager_t`, `system_dbusd_t`, `systemd_logind_t` (elogind),
+  `chronyd_t`, `bluetooth_t`, `policykit_t`, `rtkit_daemon_t`, `syslogd_t`
+  (metalog), `udev_t`, `getty_t` and `local_login_t`;
+- the login shell, the X session and everything in it
+  `unconfined_u:unconfined_r:unconfined_t`, the X server `xserver_t`;
+- `/run` is `var_run_t`, `/run/service` `initrc_runtime_t`, and the device
+  nodes have their types.
+
+`s6-undo` ran once too, between the two boots, and `s6` again after it.
+
+### 8. `sudo sh selinux/install.sh policy`
+
+With the services in their domains the kernel log says what the policy
+would refuse them. The 20 lines the log kept of a boot on 2026-11-16 (it
+drops most: see below) showed four things that this step is for:
+
+- **s6's catch-all logger.** Every service without a logger of its own
+  writes to `/run/service/s6-svscan-log/fifo`, which it inherits from
+  process 1. The policy lets a daemon write to a pipe an init script made,
+  not to this fifo, nor use a descriptor process 1 opened. Enforcing, the
+  kernel closes such descriptors when the daemon starts.
+- **`/run/NetworkManager` and `/run/tmpfiles.d`**, which s6-rc's scripts
+  make before the daemon runs. The policy gives a directory in `/run` the
+  daemon's type when the daemon makes it, and for some names when an init
+  script does (`dbus`, `chrony`, `udev`); not for these two, which came
+  out `initrc_runtime_t`, where NetworkManager may not write.
+- **`io_uring_setup`.** This kernel asks the policy for a permission of
+  its own, `io_uring allowed`. The policy has the permission and gives it
+  to no domain, the unconfined ones included.
+- **Memory that is written and then run**, which every JIT compiler
+  needs: Electron programs, the browser. The policy has a boolean for it,
+  `allow_execmem`, off by default.
+
+The step builds [wmutils_s6.te](wmutils_s6.te) with `checkmodule` and
+`semodule_package`, loads it with `semodule -i` (which builds the whole
+policy again and has the kernel load it), turns `allow_execmem` on for
+good (`setsebool -P`), and relabels the two directories. It also puts
+[rc.selinux](rc.selinux) where step 7 put it again, if that one is older.
+Policy updates from Portage keep the module and the boolean.
+
+The module gives
+
+- every daemon domain and `getty_t` the catch-all fifo
+  (`initrc_runtime_t`) and the use of process 1's descriptors;
+- `NetworkManager` and `tmpfiles.d`, made by an init script in `/run`,
+  the types `NetworkManager_runtime_t` and `tmpfiles_runtime_t`;
+- the unconfined domains `io_uring_setup`.
+
+`allow_execmem` lets every unconfined program run memory it wrote. The
+desktop needs that; it is also one of the protections SELinux has
+against injected code, and the unconfined domains are without it after
+this.
+
+Tried without root on 2026-11-16: the module built, linked with the 68
+policy packages in `/usr/share/selinux/mcs` and expanded to a policy, in which
+`sesearch` finds each of its rules. Not tried: `semodule -i` on the real
+policy store, and a boot with it.
+
+`policy-undo` takes the module out and turns the boolean off.
 
 ### Looking at what it would refuse
 
-No auditd runs under s6, so the denials go to the kernel log:
-
 ```sh
-sudo dmesg | grep avc:
+sudo sh selinux/install.sh denials
 ```
 
-## Not enforcing
+No auditd runs under s6, so the denials go to the kernel log, which is
+root's to read. The step prints one line for each thing refused: how
+often, the domain, the type and class it was refused on, what, the
+command, and the file if the kernel named one. `denials raw` prints the
+lines as the kernel logged them, for `audit2allow -i`.
 
-Permissive mode is where this stops, for a reason: Gentoo's policy knows
-OpenRC and systemd, not s6. Step 7 borrows their types for s6, and no boot
-has shown yet what the policy refuses of what s6 does under them and an
-init script does not: the supervisors' pipes and fifos, the control
-sockets in `/run/service`, s6-log and the catch-all logger that every
-daemon's output goes through.
+The kernel prints audit records through a rate limit, ten lines in five
+seconds, and a boot has hundreds: on 2026-11-16 the record numbers went
+from 10 to 177 between two lines. [rc.selinux](rc.selinux) takes the
+limit off (`kernel.printk_ratelimit=0`) at the start of a boot that is
+permissive, and the script of step 9 puts it back when it switches.
 
-Before enforcing: step 7 through a boot; a kernel log without denials for
-the things the system does every day, with a policy module for what s6
-needs and the borrowed types do not allow; and a way back that does not
-need the running system, since the command line is inside the UKI.
+In permissive mode the kernel logs each thing once for a domain: it
+remembers that it let it pass. So the log of a boot is the list, and it
+has only what was done since: before enforcing, do what the machine does every
+day (suspend and resume, a network that comes and goes, Bluetooth, sound,
+`emerge`, `emerge --config sys-kernel/asahi-kernel`) and read it again.
+
+### 9. `sudo sh selinux/install.sh enforcing`
+
+First, at run time, where a reboot undoes it:
+
+```sh
+sudo setenforce 1
+sudo setenforce 0
+```
+
+and between the two: `sudo` itself, a login on another console, and
+whatever `denials` now says was refused.
+
+The step then makes it the state after every boot. It installs
+[enforcing.start](enforcing.start) as
+`/etc/local.d/wmutils-selinux-enforcing.start` and makes
+`/etc/selinux/wmutils-enforcing`, the file that tells it to switch. It
+does not switch now. It stops unless step 7 is through a boot (`init_t`)
+and step 8 is done.
+
+At boot the script
+
+1. does nothing if SELinux is not on and permissive with a policy loaded;
+2. finds `/etc/selinux/wmutils-enforcing.trying`, its own mark from the
+   boot before, and then leaves SELinux permissive and says so;
+3. otherwise writes the mark, switches (`/sys/fs/selinux/enforce`), puts
+   the log's rate limit back, and waits in the background for a user to
+   be logged in, and still logged in 30 seconds later: a process of a uid
+   from 1000 on, outside `initrc_t`. Then it removes the mark.
+
+So a boot that enforcing breaks before anybody is logged in is followed,
+after the power button, by one that is permissive, and so is every boot
+after it until the step runs again. `sh selinux/install.sh` says which
+of the two happened.
+
+`enforcing-undo` removes the script, the file and the mark, and switches
+back to permissive at once. `s6-undo` and `policy-undo` do that first.
+
+Tried without root on 2026-11-16, on copies of the paths: not armed;
+armed with nobody logged in (the mark stays, and the next run does not
+switch); armed with a user logged in (the mark goes after the wait).
+Not tried: the step as root, and a boot.
+
+## What enforcing covers
+
+- **From `init-local` on, not from the start of the boot.** The kernel
+  command line still says `enforcing=0`, the initramfs, s6-linux-init and
+  s6-rc's first services run permissive, and the switch comes when the
+  root filesystem is writable, beside the daemons and the gettys. The
+  mark has to be written before the switch, and the command line is
+  inside the UKI, which U-Boot boots without a menu: enforcing from the
+  first instruction would have no way back but another system on a USB
+  stick. `/etc/selinux/config` keeps saying `permissive`, which is what
+  the boot starts as.
+- **The daemons the policy has a domain for**: NetworkManager, D-Bus,
+  elogind, chrony, Bluetooth, polkit, rtkit, metalog, udev, the gettys
+  and login. A domain is as tight as Gentoo's policy for OpenRC makes it.
+- **Not the user's session, and not what the policy does not know.**
+  `unconfined_t` (the login, X, everything started from it) and
+  `initrc_t` (`s6-supervise`, `s6-log`, `speakersafetyd`, `rclone`) may do
+  what they could before, except what `allow_execmem` and the other
+  booleans govern.
+- **A login that worked before the switch proves little.** With an
+  automatic login the user may be in before `init-local` gets to the
+  script. The mark then goes although no login happened under enforcing;
+  what stays tested by the boot is that the session lives through the
+  switch. `sudo` and a second login are for the run-time trial above.
 
 ## Undoing it
 
@@ -277,7 +415,8 @@ need the running system, since the command line is inside the UKI.
 sudo sh selinux/install.sh remove
 ```
 
-undoes step 7 as `s6-undo` does, puts the profile link back, takes `lsm=`
+undoes steps 9, 8 and 7 as `enforcing-undo`, `policy-undo` and `s6-undo`
+do, puts the profile link back, takes `lsm=`
 and `enforcing=0` out of `/etc/kernel/cmdline`, and removes the dracut
 drop-in and the selinuxfs script. Then
 `emerge --config sys-kernel/asahi-kernel` and a reboot for a kernel

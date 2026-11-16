@@ -1,0 +1,76 @@
+#!/bin/sh
+# wmutils: installed as /etc/local.d/wmutils-selinux-enforcing.start
+# by selinux/install.sh enforcing. s6-rc's init-local runs it at every boot.
+#
+# Switches SELinux from permissive to enforcing, with a way back that does
+# not need the running system: the kernel command line is inside the UKI,
+# and U-Boot has no menu to pick another from.
+# - The boot starts permissive (enforcing=0 on the command line) and gets
+#   as far as this script, which runs once the root filesystem is writable,
+#   beside the daemons and the gettys.
+# - Before it switches, it leaves a mark in /etc/selinux. The mark goes
+#   away once a user has been logged in for a while under enforcing.
+# - A boot that finds the mark does not switch: the boot before it went
+#   enforcing and nobody got in. It stays permissive, at every boot, until
+#   selinux/install.sh enforcing arms it again.
+# So a boot that enforcing breaks is followed, after the power button, by
+# one that works. See selinux/README.md.
+
+PATH=/usr/bin:/usr/sbin:/bin:/sbin
+# The switch: there if selinux/install.sh enforcing put it there.
+want=/etc/selinux/wmutils-enforcing
+# The mark.
+trying=$want.trying
+# How long a user has to be in before the boot counts as good, in seconds.
+settle=30
+
+[ -e "$want" ] || exit 0
+[ -e /sys/fs/selinux/enforce ] || exit 0
+[ -d /sys/fs/selinux/class/file ] || exit 0
+[ "$(cat /sys/fs/selinux/enforce)" = 0 ] || exit 0
+if [ -e "$trying" ]; then
+	echo "wmutils: the last boot went enforcing and no user got in: SELinux stays permissive." >&2
+	echo "wmutils: arm it again with: sudo sh selinux/install.sh enforcing" >&2
+	exit 0
+fi
+
+# Is a user logged in? A process of a login user's (a uid from 1000 on)
+# outside initrc_t, where the services that run as a user are.
+user_in() {
+	for p in /proc/[0-9]*; do
+		u=$(stat -c %u "$p" 2>/dev/null) || continue
+		[ "$u" -ge 1000 ] && [ "$u" -lt 60000 ] || continue
+		l=$(tr -d '\0' <"$p/attr/current" 2>/dev/null) || continue
+		case "$l" in
+		'' | *:initrc_t:*) ;;
+		*) return 0 ;;
+		esac
+	done
+	return 1
+}
+
+# No mark, no switch.
+: >"$trying" || exit 0
+sync "$trying" || exit 0
+echo 1 >/sys/fs/selinux/enforce || {
+	rm -f "$trying"
+	exit 0
+}
+# Enforcing refuses the same thing over and over: the kernel's rate limit
+# on its log again, which rc.selinux took off for permissive.
+echo 5 2>/dev/null >/proc/sys/kernel/printk_ratelimit
+
+# The boot is good once a user is in and still in after $settle seconds.
+(
+	while :; do
+		if user_in; then
+			sleep "$settle"
+			if user_in; then
+				rm -f "$trying"
+				exit 0
+			fi
+		fi
+		sleep 5
+	done
+) </dev/null >/dev/null 2>&1 &
+exit 0

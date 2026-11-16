@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# wmutils: what s6 needs of the policy and the types selinux/install.sh s6
+# borrows for it do not allow. Built and loaded by selinux/install.sh policy.
+# See selinux/README.md.
+module wmutils_s6 1.0;
+
+require {
+	type init_t;
+	type initrc_t;
+	type initrc_runtime_t;
+	type var_run_t;
+	type getty_t;
+	attribute daemon;
+	attribute unconfined_domain_type;
+	class dir search;
+	class fd use;
+	class fifo_file { append getattr ioctl lock read write };
+	class io_uring allowed;
+}
+
+# The catch-all logger. s6-linux-init opens /run/service/s6-svscan-log/fifo
+# as the output of process 1, and every service without a logger of its own
+# (the gettys, udevd, metalog's errors) inherits it through s6-svscan and
+# s6-supervise. The policy lets a daemon write to a pipe an init script
+# made, not to this fifo, which is a file in /run, nor use a descriptor
+# process 1 opened. Without these the kernel closes the descriptors when
+# the daemon starts, and what it says is lost.
+allow daemon init_t:fd use;
+allow { daemon getty_t } initrc_runtime_t:fifo_file { append getattr ioctl lock read write };
+
+# Directories in /run that a run script or a oneshot makes before the
+# daemon starts. The policy gives them the daemon's type only when the
+# daemon makes them itself; made by a script they would be
+# initrc_runtime_t, where the daemon may not write.
+optional {
+	require {
+		type NetworkManager_runtime_t;
+	}
+	type_transition initrc_t var_run_t:dir NetworkManager_runtime_t "NetworkManager";
+}
+optional {
+	require {
+		type tmpfiles_runtime_t;
+	}
+	type_transition initrc_t var_run_t:dir tmpfiles_runtime_t "tmpfiles.d";
+}
+
+# io_uring_setup(2). The kernel asks for this permission, and the policy
+# of 2.20260616 has it and gives it to no domain, the unconfined ones
+# included: enforcing, no program could set up an io_uring.
+allow unconfined_domain_type self:io_uring allowed;
