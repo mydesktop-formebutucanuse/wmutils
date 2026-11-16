@@ -121,14 +121,40 @@ static void scale_copy(Display *dpy, Drawable src, Drawable dst,
     XRenderFreePicture(dpy, to);
 }
 
-/* Draws the top-left w x h pixels of the dock app's pixmap on its window,
- * n times as large. Both have the default visual of the screen. */
-static void scale_draw(Display *dpy, Pixmap pixmap, Window win,
+/* Draws the top-left w x h pixels of the dock app's pixmap on dst, n times
+ * as large. Both have the default visual (or depth) of the screen. */
+static void scale_draw(Display *dpy, Pixmap pixmap, Drawable dst,
 		       unsigned int w, unsigned int h, int n)
 {
     Visual *visual = DefaultVisual(dpy, DefaultScreen(dpy));
 
-    scale_copy(dpy, pixmap, win, XRenderFindVisualFormat(dpy, visual), w, h, n);
+    scale_copy(dpy, pixmap, dst, XRenderFindVisualFormat(dpy, visual), w, h, n);
+}
+
+/*
+ * The large picture is not drawn on the window: it is drawn into a pixmap of
+ * the size of the window, which is made the window's background. The X
+ * server puts a background back by itself, at once, where the window is
+ * uncovered (by a window moved over the Dock), instead of clearing it and
+ * sending an Expose that the dock app answers some time later.
+ */
+
+/* A pixmap for the picture of w x h pixels made n times as large. */
+static Pixmap scale_background(Display *dpy, unsigned int w, unsigned int h, int n)
+{
+    int screen = DefaultScreen(dpy);
+
+    return XCreatePixmap(dpy, RootWindow(dpy, screen), w * n, h * n,
+			 DefaultDepth(dpy, screen));
+}
+
+/* Shows what was drawn into background on win. It is set again each time:
+ * what is drawn into a pixmap after it was made the background of a window
+ * may not reach the window. */
+static void scale_show(Display *dpy, Window win, Pixmap background)
+{
+    XSetWindowBackgroundPixmap(dpy, win, background);
+    XClearWindow(dpy, win);
 }
 
 /* A shape mask (a pixmap of depth 1) of w x h pixels, n times as large. */
