@@ -1,0 +1,303 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Plays YouTube, SoundCloud and other yt-dlp sites in Audacious.
+#
+#   audweb URL...      play the tracks now, in Audacious's "Now Playing"
+#                      playlist (what was in it goes)
+#   audweb -e URL...   add them to the end of the current playlist
+#   audweb -t S URL    start the first track S seconds in
+#   audweb -t S -c URL the same for a track that is playing somewhere else
+#                      and goes on while audweb starts: S is where it was
+#                      when audweb was started, and the time audweb takes
+#                      is added. audweb-host uses this to take over from
+#                      the browser.
+#   audweb -e -a TRACK URL...
+#                      add what comes after TRACK in each URL's list (the
+#                      whole list when TRACK is not in it), and no track
+#                      twice, nor TRACK itself: what plays after TRACK in
+#                      the browser. audweb-host uses this after -t -c.
+#   -n N               add N tracks at most
+#
+# A URL can be one track or a playlist, set, album or channel. Each track
+# goes into Audacious as soon as yt-dlp has found it, so the first one plays
+# while the rest are still being looked up.
+#
+# Tracks are downloaded first, into ${XDG_CACHE_HOME:-~/.cache}/audweb,
+# and played from there: YouTube's by curl, in pieces (see fetch()), and
+# those that a site serves only in HLS pieces (SoundCloud), which Audacious
+# cannot read, by yt-dlp. A cached track is used again, and one that has
+# not been played for 7 days is removed. They go into Audacious with the
+# title, artist and length that yt-dlp gave, through a one-track XSPF
+# playlist. Tracks of other sites that are a plain HTTPS file of unknown
+# size are streamed: Audacious reads them from the site directly, from an
+# address that works for some hours only.
+set -eu
+
+usage() {
+	echo "usage: ${0##*/} [-e] URL..." >&2
+	echo "       ${0##*/} -t SECONDS [-c] URL..." >&2
+	echo "       ${0##*/} -e -a TRACK URL..." >&2
+	echo "       -n N: N tracks at most" >&2
+	exit 2
+}
+
+# Before anything else, for -c.
+started=$(date +%s.%N)
+
+enqueue= start= catchup= after= max=
+while getopts a:ecn:t: opt; do
+	case $opt in
+	a) after=$OPTARG ;;
+	e) enqueue=1 ;;
+	n) max=$OPTARG ;;
+	t) start=$OPTARG ;;
+	c) catchup=1 ;;
+	*) usage ;;
+	esac
+done
+shift $((OPTIND - 1))
+[ $# -gt 0 ] || usage
+# -t is for the track that starts playing, and -e starts none.
+if [ -n "$start" ] && [ -n "$enqueue" ]; then usage; fi
+if [ -n "$catchup" ] && [ -z "$start" ]; then usage; fi
+case $start in
+*[!0-9.]* | *.*.*) usage ;;
+esac
+case $max in
+*[!0-9]* | 0) usage ;;
+esac
+
+for cmd in yt-dlp audacious audtool curl; do
+	command -v "$cmd" >/dev/null || {
+		echo "${0##*/}: $cmd not found" >&2
+		exit 1
+	}
+done
+
+cache=${XDG_CACHE_HOME:-$HOME/.cache}/audweb
+mkdir -p "$cache/xspf"
+find "$cache" -type f -mtime +7 -delete 2>/dev/null || :
+# Playlists of streamed tracks: their addresses are dead by then.
+find "$cache/xspf" -type f -mtime +1 -delete 2>/dev/null || :
+
+# Opus or AAC over plain HTTPS first: those Audacious can stream.
+fmt='bestaudio[protocol=https][acodec=opus]/bestaudio[protocol=https]/bestaudio/best'
+# Not a tab: read joins runs of IFS white space, and fields can be empty.
+sep=$(printf '\037')
+
+xml() {
+	printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' \
+		-e 's/>/\&gt;/g' -e 's/"/\&quot;/g'
+}
+
+# audtool needs Audacious running, so it is started before yt-dlp's first
+# answer, not after it.
+if ! audtool version >/dev/null 2>&1; then
+	audacious >/dev/null 2>&1 &
+	i=0
+	until audtool version >/dev/null 2>&1; do
+		i=$((i + 1))
+		[ $i -lt 100 ] || {
+			echo "${0##*/}: Audacious did not start" >&2
+			exit 1
+		}
+		sleep 0.1
+	done
+fi
+
+# Downloads YouTube's file at URL, SIZE bytes, to FILE, a piece at a
+# time with a Range header. YouTube sends the address alone, as Audacious
+# would ask for it, slowly once the file is over 10 MB or so (30 KB/s for
+# a 15 MB one: a long track took half a minute to start, and a change to
+# it could fail), and each range at full speed. A new address answers 403
+# for a second or two (yt-dlp waits too), so a piece is tried again.
+fetch() {
+	rm -f "$3.part"
+	o=0
+	while [ "$o" -lt "$2" ]; do
+		e=$((o + 4194304 - 1))
+		[ "$e" -lt "$2" ] || e=$(($2 - 1))
+		i=0
+		until curl -sf -r "$o-$e" -o "$3.piece" "$1"; do
+			i=$((i + 1))
+			[ $i -lt 20 ] || {
+				rm -f "$3.piece" "$3.part"
+				return 1
+			}
+			sleep 0.5
+		done
+		cat "$3.piece" >>"$3.part"
+		o=$((e + 1))
+	done
+	rm -f "$3.piece"
+	[ "$(wc -c <"$3.part")" -eq "$2" ] || {
+		rm -f "$3.part"
+		return 1
+	}
+	mv "$3.part" "$3"
+}
+
+# The album for a track that has none.
+sitename() {
+	case $1 in
+	Youtube) echo YouTube ;;
+	Soundcloud) echo SoundCloud ;;
+	*) echo "$1" ;;
+	esac
+}
+
+# Seeks the track that has just started to -t's time: once Audacious has
+# opened it and plays, since a seek before that is lost.
+seek() {
+	i=0
+	until [ "$(audtool current-song-output-length-frames 2>/dev/null || echo 0)" -gt 0 ]; do
+		i=$((i + 1))
+		[ $i -lt 300 ] || {
+			echo "${0##*/}: the track did not start, not seeking" >&2
+			return 0
+		}
+		sleep 0.1
+	done
+	pos=$start
+	if [ -n "$catchup" ]; then
+		pos=$(awk -v s="$start" -v t0="$started" -v t1="$(date +%s.%N)" \
+			'BEGIN { printf "%.2f", s + t1 - t0 }')
+	fi
+	audtool playback-seek "$pos"
+}
+
+first=1
+add() {
+	if [ -n "$first" ] && [ -z "$enqueue" ]; then
+		# What plays now must not be the one seek() sees playing.
+		[ -z "$start" ] || audtool playback-stop
+		# Empties "Now Playing", makes it current, and plays.
+		audtool playlist-addurl-to-new-playlist "$1"
+		[ -z "$start" ] || seek
+	else
+		audtool playlist-addurl "$1"
+	fi
+	first=
+}
+
+# -a's track as yt-dlp names it, SITE-ID, the same in a list as alone.
+afterkey=
+if [ -n "$after" ]; then
+	case $after in
+	https://www.youtube.com/watch\?v=* | https://youtube.com/watch\?v=*)
+		afterkey=Youtube-$(printf '%s' "${after#*v=}" | cut -c1-11)
+		;;
+	*)
+		afterkey=$(yt-dlp --no-warnings --flat-playlist --no-playlist \
+			--print '%(extractor_key)s-%(id)s' "$after" 2>/dev/null | head -n1) || :
+		;;
+	esac
+fi
+
+# How far into a list -a's track is looked for.
+searchmax=1000
+
+# yt-dlp's line for each track of each URL, from after -a's track.
+lookup() {
+	for u in "$@"; do
+		items=
+		if [ -n "$afterkey" ]; then
+			# Read lazily and stopped at the track: a YouTube Mix has
+			# hundreds, and takes 20 s to read to its end.
+			pos=$(yt-dlp --no-warnings --flat-playlist --lazy-playlist \
+				--playlist-items "1:$searchmax" \
+				--print '%(extractor_key)s-%(id)s' "$u" 2>/dev/null |
+				awk -v k="$afterkey" '$0 == k { print NR; exit }') || :
+			[ -z "$pos" ] || items=$((pos + 1)):${max:+$((pos + max))}
+		fi
+		[ -n "$items" ] || [ -z "$max" ] || items=1:$max
+		yt-dlp --ignore-errors --no-warnings -f "$fmt" \
+			${items:+--playlist-items "$items"} --print \
+			"%(protocol)s$sep%(extractor_key)s$sep%(id)s$sep%(title)s$sep%(artist,uploader,channel|)s$sep%(album|)s$sep%(duration|0)s$sep%(filesize|)s$sep%(ext)s$sep%(webpage_url)s$sep%(url)s" \
+			"$u"
+	done
+}
+
+# The tracks added so far, and -a's, as " SITE-ID SITE-ID ".
+seen=" $afterkey "
+n=0
+lookup "$@" | {
+	while IFS=$sep read -r proto site id title artist album dur size ext page url; do
+		case $seen in
+		*" $site-$id "*) continue ;;
+		esac
+		seen="$seen$site-$id "
+		# Not a break: yt-dlp, still writing, would fail on each line.
+		[ -z "$max" ] || [ $n -lt "$max" ] || continue
+		n=$((n + 1))
+		case $proto in
+		https | http)
+			loc=$url
+			# yt-dlp does not always know the size; YouTube's address
+			# has it.
+			[ "$site" != Youtube ] || [ -n "$size" ] ||
+				size=$(printf '%s' "$url" | sed -n 's/.*[?&]clen=\([0-9]*\).*/\1/p')
+			if [ "$site" = Youtube ] && [ -n "$size" ]; then
+				f=$cache/$site-$id.$ext
+				if [ ! -f "$f" ] || [ "$(wc -c <"$f")" -ne "$size" ]; then
+					fetch "$url" "$size" "$f" || {
+						echo "${0##*/}: could not download $page" >&2
+						continue
+					}
+				fi
+				touch "$f"
+				loc=file://$f
+			elif [ -n "$first" ] && [ -z "$enqueue" ]; then
+				# A new address may answer 403 for a second or two, and
+				# Audacious would give up on the track.
+				i=0
+				until [ "$(curl -s -o /dev/null -w '%{http_code}' -r 0-0 "$url")" = 206 ] ||
+					[ $i -ge 20 ]; do
+					i=$((i + 1))
+					sleep 0.5
+				done
+			fi
+			ms=$(awk -v d="$dur" 'BEGIN { printf "%d", d * 1000 }')
+			f=$cache/xspf/$site-$id.xspf
+			{
+				echo '<?xml version="1.0" encoding="UTF-8"?>'
+				echo '<playlist version="1" xmlns="http://xspf.org/ns/0/"><trackList><track>'
+				echo "<location>$(xml "$loc")</location>"
+				echo "<title>$(xml "$title")</title>"
+				# Left out, Audacious shows the server's host name
+				# as the album; empty, " -  - " in the title.
+				[ -n "$album" ] || album=$(sitename "$site")
+				[ -z "$artist" ] || echo "<creator>$(xml "$artist")</creator>"
+				echo "<album>$(xml "$album")</album>"
+				[ "$ms" -eq 0 ] || echo "<duration>$ms</duration>"
+				echo "<info>$(xml "$page")</info>"
+				echo '</track></trackList></playlist>'
+			} >"$f"
+			add "$f"
+			;;
+		*)
+			# HLS and the like: download, then play the file.
+			f=$(find "$cache" -maxdepth 1 -name "$site-$id.*" ! -name '*.part' | head -n1)
+			if [ -z "$f" ]; then
+				echo "${0##*/}: downloading $title" >&2
+				# Without an album Audacious shows the folder's name,
+				# "audweb".
+				yt-dlp --quiet --no-warnings --no-playlist -f "$fmt" \
+					--parse-metadata "%(album|$(sitename "$site"))s:%(meta_album)s" \
+					--embed-metadata -o "$cache/$site-$id.%(ext)s" "$page" || {
+					echo "${0##*/}: could not download $page" >&2
+					continue
+				}
+				f=$(find "$cache" -maxdepth 1 -name "$site-$id.*" ! -name '*.part' | head -n1)
+			fi
+			touch "$f"
+			add "$f"
+			;;
+		esac
+	done
+	# yt-dlp has said why.
+	[ -z "$first" ] || {
+		echo "${0##*/}: nothing to play" >&2
+		exit 1
+	}
+}

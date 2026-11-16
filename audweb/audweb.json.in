@@ -1,0 +1,7 @@
+{
+  "name": "audweb",
+  "description": "Plays the browser's track in Audacious",
+  "path": "@HOST@",
+  "type": "stdio",
+  "allowed_extensions": ["audweb@wmutils"]
+}
