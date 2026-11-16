@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "audweb",
+  "version": "1.0",
+  "description": "Hands the YouTube or SoundCloud track this tab plays over to Audacious, at the same place, through audweb.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "audweb@wmutils",
+      "strict_min_version": "140.0",
+      "data_collection_permissions": { "required": ["none"] }
+    }
+  },
+  "permissions": ["activeTab", "nativeMessaging", "scripting"],
+  "background": { "scripts": ["background.js"] },
+  "action": {
+    "default_title": "Play in Audacious (Alt+Shift+A)",
+    "default_icon": "icon.svg"
+  },
+  "icons": { "48": "icon.svg", "96": "icon.svg" },
+  "commands": {
+    "_execute_action": {
+      "suggested_key": { "default": "Alt+Shift+A" },
+      "description": "Play this tab's track in Audacious"
+    }
+  }
+}

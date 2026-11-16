@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
+  <!-- A play sign leaving a page for a speaker: the tab's sound moving on. -->
+  <rect x="3" y="9" width="24" height="30" rx="4" fill="none" stroke="#5b6b7f" stroke-width="3"/>
+  <path d="M11 17 L21 24 L11 31 Z" fill="#5b6b7f"/>
+  <path d="M30 19 h5 l7 -6 v22 l-7 -6 h-5 Z" fill="#e8743b"/>
+</svg>

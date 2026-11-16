@@ -4,9 +4,9 @@
 EAPI=8
 
 RUST_MIN_VER="1.85.0"
-inherit cargo git-r3 toolchain-funcs udev
+inherit cargo git-r3 optfeature toolchain-funcs udev
 
-DESCRIPTION="Window Maker desktop utilities: mediakeyd, autobrightd, scd, ledclock, nsrun, dock apps"
+DESCRIPTION="Window Maker desktop utilities: mediakeyd, autobrightd, scd, ledclock, nsrun, audweb, dock apps"
 HOMEPAGE="https://github.com/mydesktop-formebutucanuse/wmutils"
 EGIT_REPO_URI="https://github.com/mydesktop-formebutucanuse/wmutils.git"
 
@@ -41,7 +41,11 @@ RDEPEND="${DEPEND}
 	x11-apps/xauth
 	x11-apps/xrdb
 "
-BDEPEND="virtual/pkgconfig"
+# zip: audweb's LibreWolf extension
+BDEPEND="
+	app-arch/zip
+	virtual/pkgconfig
+"
 
 src_unpack() {
 	git-r3_src_unpack
@@ -55,6 +59,9 @@ src_compile() {
 	cargo_src_compile
 	emake -C dockapps CC="$(tc-getCC)" PKG_CONFIG="$(tc-getPKG_CONFIG)" \
 		PREFIX="${EPREFIX}/usr"
+	pushd audweb/librewolf >/dev/null || die
+	zip -q -X "${T}"/audweb.xpi manifest.json background.js icon.svg || die
+	popd >/dev/null || die
 }
 
 src_install() {
@@ -64,13 +71,22 @@ src_install() {
 	emake -C dockapps DESTDIR="${D}" PREFIX="${EPREFIX}/usr" install
 	dobin backlight/backlight
 	dobin nsrun/nsrun nsrun/nsrun-xserver
+	dobin audweb/audweb audweb/audweb-host
+	# The extension's way to audweb-host, for LibreWolf and Firefox.
+	insinto /usr/$(get_libdir)/mozilla/native-messaging-hosts
+	sed -e "s|@HOST@|${EPREFIX}/usr/bin/audweb-host|" \
+		audweb/audweb.json.in | newins - audweb.json
+	# The extension itself, where LibreWolf takes it unsigned, and on, in
+	# every profile.
+	insinto /usr/$(get_libdir)/librewolf/browser/extensions
+	newins "${T}"/audweb.xpi audweb@wmutils.xpi
 	# Lets the video group write the backlights, so autobrightd runs as
 	# the desktop user.
 	udev_dorules autobrightd/90-autobrightd.rules
 
 	dodoc README.md
 	local tool
-	for tool in autobrightd backlight dockapps kernel ledclock mediakeyd nsrun scd; do
+	for tool in audweb autobrightd backlight dockapps kernel ledclock mediakeyd nsrun scd; do
 		docinto "${tool}"
 		dodoc "${tool}"/README.md
 	done
@@ -98,6 +114,10 @@ pkg_postinst() {
 	elog "and drag it to its place, or a corner of it to its size."
 	elog "nsrun -x needs the X server started through nsrun-xserver: see"
 	elog "/usr/share/doc/${PF}/nsrun/README.md*."
+	elog "audweb's LibreWolf button is there after LibreWolf's next start; see"
+	elog "/usr/share/doc/${PF}/audweb/README.md*."
+	optfeature "audweb (YouTube and SoundCloud in Audacious)" \
+		"media-sound/audacious media-plugins/audacious-plugins[ffmpeg,http] net-misc/yt-dlp net-misc/curl"
 	elog "The kernel patches are not part of this package: see"
 	elog "/usr/share/doc/${PF}/kernel/README.md*."
 }

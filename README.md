@@ -17,12 +17,14 @@ Gentoo (Asahi Linux, Apple Silicon MacBook).
 | [network](network) | Keeps the machine from being found or reached on the networks it joins: a firewall that lets in nothing unasked and does not answer ping, and no hostname or real MAC address given to the network |
 | [nsrun](nsrun) | Runs a program in Linux namespaces of its own, with a home of its own, so that it cannot read or change the rest of the system; with XLibre's Xnamespace extension its windows can be cut off from the others too |
 | [selinux](selinux) | Brings SELinux up in permissive mode, one step at a time: the Portage profile, the tools and the policy, the kernel command line and the initramfs, the labels, and s6's init, services and logins in the policy's domains |
+| [audweb](audweb) | Plays YouTube, SoundCloud and the other sites yt-dlp knows in Audacious: YouTube streamed, SoundCloud downloaded first, with titles and no ads; and a LibreWolf button that hands the track the tab plays over to Audacious, from the same place, with what the site would have played after it |
 
 ## Install on Gentoo
 
 [gentoo](gentoo) has a live ebuild, `x11-misc/wmutils-9999`, that
 builds the latest commit here and installs all the tools: `mediakeyd`,
-`autobrightd`, `scd`, `ledclock`, `backlight`, `nsrun`, `nsrun-xserver` and the dock
+`autobrightd`, `scd`, `ledclock`, `backlight`, `nsrun`, `nsrun-xserver`,
+`audweb`, `audweb-host` and the dock
 apps `wmclock`, `wmacpi` and `wmacpi-cli` in `/usr/bin`, autobrightd's udev
 rule in `/usr/lib/udev/rules.d`, the dock apps' man pages, and the READMEs.
 The kernel patches and config,
