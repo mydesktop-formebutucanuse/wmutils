@@ -11,6 +11,10 @@
 #   service directories it copied there. With it, what the services make
 #   in /run gets the types the policy has for it.
 # - The labels of the device nodes the kernel made before udev runs.
+# - The labels of the firmware in /usr/lib/firmware/vendor, on Apple
+#   hardware: the initramfs copies it from the ESP to a tmpfs before a
+#   policy is loaded, and the kernel may load firmware from lib_t only.
+#   Wi-Fi and Bluetooth ask for theirs again whenever they are turned on.
 # And for reading what the policy would refuse:
 # - With no auditd the kernel prints the denials to its log, through a rate
 #   limit of ten lines in five seconds. A boot has hundreds, so while
@@ -29,4 +33,5 @@ if [ "$(cat /sys/fs/selinux/enforce 2>/dev/null)" = 0 ]; then
 	echo 0 2>/dev/null >/proc/sys/kernel/printk_ratelimit
 fi
 restorecon -RF /run /dev
+[ ! -d /usr/lib/firmware/vendor ] || restorecon -RF /usr/lib/firmware/vendor
 exit 0

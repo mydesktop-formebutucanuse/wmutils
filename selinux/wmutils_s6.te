@@ -1,32 +1,46 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-# wmutils: what s6 needs of the policy and the types selinux/install.sh s6
-# borrows for it do not allow. Built and loaded by selinux/install.sh policy.
-# See selinux/README.md.
-module wmutils_s6 1.0;
+# wmutils: what s6 and this machine need of the policy, and the policy for
+# OpenRC and the types selinux/install.sh s6 borrows do not allow. Built and
+# loaded by selinux/install.sh policy. Each rule is for a denial in the
+# kernel log of a permissive boot. See selinux/README.md.
+module wmutils_s6 1.1;
 
 require {
 	type init_t;
 	type initrc_t;
 	type initrc_runtime_t;
+	type kernel_t;
 	type var_run_t;
-	type getty_t;
 	attribute daemon;
+	attribute domain;
 	attribute unconfined_domain_type;
-	class dir search;
+	class capability2 perfmon;
+	class chr_file { read write };
+	class dbus send_msg;
+	class dir { getattr mounton open read search write };
 	class fd use;
-	class fifo_file { append getattr ioctl lock read write };
+	class fifo_file { append getattr ioctl lock write };
+	class file { getattr open read setattr unlink watch write };
+	class filesystem getattr;
 	class io_uring allowed;
+	class process setsched;
+	class unix_stream_socket { getattr read write };
 }
 
-# The catch-all logger. s6-linux-init opens /run/service/s6-svscan-log/fifo
-# as the output of process 1, and every service without a logger of its own
-# (the gettys, udevd, metalog's errors) inherits it through s6-svscan and
-# s6-supervise. The policy lets a daemon write to a pipe an init script
-# made, not to this fifo, which is a file in /run, nor use a descriptor
-# process 1 opened. Without these the kernel closes the descriptors when
-# the daemon starts, and what it says is lost.
+# What everything s6 starts inherits. Enforcing, the kernel closes a
+# descriptor the new program's domain may not use, and what the program
+# says is lost.
+# - /run/service/s6-svscan-log/fifo, the catch-all logger: the output of
+#   process 1 and so of every service and oneshot without a logger of its
+#   own. The policy lets a daemon write to a pipe an init script made, not
+#   to this fifo, which is a file in /run.
+# - The descriptors process 1 opened, and /dev/console, which the kernel
+#   opened for it.
+# - The service directory in /run/service, which is where a service runs.
 allow daemon init_t:fd use;
-allow { daemon getty_t } initrc_runtime_t:fifo_file { append getattr ioctl lock read write };
+allow domain kernel_t:fd use;
+allow domain initrc_runtime_t:fifo_file { append getattr ioctl lock write };
+allow domain initrc_runtime_t:dir search;
 
 # Directories in /run that a run script or a oneshot makes before the
 # daemon starts. The policy gives them the daemon's type only when the
@@ -49,3 +63,116 @@ optional {
 # of 2.20260616 has it and gives it to no domain, the unconfined ones
 # included: enforcing, no program could set up an io_uring.
 allow unconfined_domain_type self:io_uring allowed;
+
+# The X server gets its devices from elogind, which opens them and sends
+# the descriptors over the system bus: the bus daemon has to be allowed
+# what it passes on. Without this X has no screen and no input.
+optional {
+	require {
+		type system_dbusd_t;
+		type dri_device_t;
+		type event_device_t;
+	}
+	allow system_dbusd_t { dri_device_t event_device_t }:chr_file { read write };
+}
+
+# elogind, in the domain the policy has for systemd-logind:
+# - it watches the cgroup of a session for becoming empty;
+# - it reads /proc/pressure, and the boot loader entries on the ESP, which
+#   it looks for when asked what a reboot can boot into;
+# - it sets the scheduling of the login it makes a session for.
+optional {
+	require {
+		type systemd_logind_t;
+		type cgroup_t;
+		type dosfs_t;
+		type local_login_t;
+		type proc_psi_t;
+	}
+	allow systemd_logind_t cgroup_t:file watch;
+	allow systemd_logind_t dosfs_t:dir { getattr open read search };
+	allow systemd_logind_t dosfs_t:file { getattr open read };
+	allow systemd_logind_t proc_psi_t:dir search;
+	allow systemd_logind_t proc_psi_t:file { getattr open read };
+	allow systemd_logind_t local_login_t:process setsched;
+}
+
+# rtkit asks elogind to hold a suspend back until it has taken the
+# real-time priorities away, and holds the pipe elogind gives it for that.
+optional {
+	require {
+		type rtkit_daemon_t;
+		type systemd_logind_t;
+		type systemd_logind_inhibit_runtime_t;
+	}
+	allow rtkit_daemon_t systemd_logind_t:dbus send_msg;
+	allow systemd_logind_t rtkit_daemon_t:dbus send_msg;
+	allow rtkit_daemon_t systemd_logind_t:fd use;
+	allow rtkit_daemon_t systemd_logind_inhibit_runtime_t:fifo_file write;
+}
+
+# udev:
+# - elogind's uaccess, which gives the user at the seat the sound, video
+#   and input devices, reads the seat in /run/systemd/seats;
+# - a rule gives the backlight's brightness file in /sys to a group;
+# - udevd looks at its own namespaces.
+optional {
+	require {
+		type udev_t;
+		type nsfs_t;
+		type sysfs_t;
+		type systemd_sessions_runtime_t;
+	}
+	allow udev_t systemd_sessions_runtime_t:dir search;
+	allow udev_t systemd_sessions_runtime_t:file { getattr open read };
+	allow udev_t sysfs_t:file setattr;
+	allow udev_t nsfs_t:file getattr;
+}
+
+# A FUSE mount by a service that runs as a user (rclone): fusermount3 gets
+# the descriptor of /dev/fuse back to the service over a socket the
+# service made, and wants the user to be able to write to the mount point,
+# a directory in the home.
+optional {
+	require {
+		type mount_t;
+		type user_home_t;
+	}
+	allow mount_t initrc_t:unix_stream_socket { getattr read write };
+	allow mount_t user_home_t:dir write;
+}
+
+# A tmpfs from fstab on Portage's build directory.
+optional {
+	require {
+		type mount_t;
+		type portage_tmp_t;
+	}
+	allow mount_t portage_tmp_t:dir mounton;
+}
+
+# startx writes the server's key to a file it made in /tmp, with xauth,
+# and removes the file at the end. The policy lets xauth read it.
+optional {
+	require {
+		type xauth_t;
+		type user_tmp_t;
+	}
+	allow xauth_t user_tmp_t:file { unlink write };
+}
+
+optional {
+	require {
+		type hwclock_t;
+		type proc_t;
+	}
+	allow hwclock_t proc_t:filesystem getattr;
+}
+
+# NetworkManager can do without; the kernel asks all the same.
+optional {
+	require {
+		type NetworkManager_t;
+	}
+	dontaudit NetworkManager_t self:capability2 perfmon;
+}

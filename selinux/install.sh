@@ -267,6 +267,40 @@ s6_undo() {
 	fi
 }
 
+# Labels the directories that mounts cover, which restorecon cannot reach:
+# each through a second mount of the filesystem it is on, with nothing
+# mounted in it. Only on a filesystem on a disk, where a label stays.
+label_covered() {
+	mnt=$(mktemp -d)
+	trap 'umount "$mnt" 2>/dev/null; rmdir "$mnt" 2>/dev/null' EXIT
+	findmnt -rno TARGET | while read -r t; do
+		[ "$t" != / ] && [ "$t" != "$mnt" ] || continue
+		up=${t%/*}
+		on=$(findmnt -rno TARGET --target "${up:-/}") || continue
+		case "$(findmnt -rno SOURCE --target "${up:-/}")" in
+		/dev/*) ;;
+		*) continue ;;
+		esac
+		con=$(matchpathcon -n "$t" 2>/dev/null) || continue
+		case "$con" in
+		*:*:*) ;;
+		*) continue ;;
+		esac
+		mount -o bind "$on" "$mnt" || continue
+		under=$mnt${t#"${on%/}"}
+		if [ -d "$under" ] && [ ! -L "$under" ] && [ "$(ls -Zd "$under" | cut -d' ' -f1)" != "$con" ]; then
+			if chcon -h "$con" "$under"; then
+				echo "the directory under $t: $con"
+			else
+				echo "could not label the directory under $t" >&2
+			fi
+		fi
+		umount "$mnt"
+	done
+	rmdir "$mnt"
+	trap - EXIT
+}
+
 # The kernel's own list of security modules with selinux in it, for lsm=:
 # before bpf, which stays last, or at the end.
 lsm_list() {
@@ -505,18 +539,7 @@ relabel)
 		world_update >&2
 		exit 1
 	fi
-	# The directories that mounts cover: label them through a second
-	# mount of / that has nothing mounted in it.
-	mnt=$(mktemp -d)
-	trap 'umount "$mnt" 2>/dev/null; rmdir "$mnt" 2>/dev/null' EXIT
-	mount -o bind / "$mnt"
-	findmnt -rno TARGET | while read -r t; do
-		[ "$t" != / ] && [ "$t" != "$mnt" ] && [ -d "$mnt$t" ] || continue
-		setfiles -r "$mnt" "$contexts" "$mnt$t" || echo "could not label the directory under $t" >&2
-	done
-	umount "$mnt"
-	rmdir "$mnt"
-	trap - EXIT
+	label_covered
 	echo "labelled the directories under the mount points"
 	# A swap file needs a type of its own.
 	sed 1d /proc/swaps | while read -r f kind rest; do
@@ -646,6 +669,11 @@ policy)
 	for d in /run/NetworkManager /run/tmpfiles.d; do
 		[ ! -e "$d" ] || restorecon -RF "$d"
 	done
+	# A mount point on another filesystem than /, such as a FUSE mount
+	# in the home: relabel did not get to the directory under it before
+	# 2026-11-16, and fusermount3 may not mount on an unlabelled one.
+	label_covered
+	[ ! -d /usr/lib/firmware/vendor ] || restorecon -RF /usr/lib/firmware/vendor
 	# The script rc.init runs, if the s6 step put an older one there.
 	if s6_paths && [ -e "$hook" ] && ! cmp -s "$here/rc.selinux" "$hook"; then
 		install -m 755 "$here/rc.selinux" "$hook"

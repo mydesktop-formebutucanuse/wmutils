@@ -12,7 +12,7 @@ is a way back (see [What enforcing covers](#what-enforcing-covers)).
 | [make.defaults](make.defaults) | For the Portage profile: one policy store, `mcs` |
 | [dracut.conf](dracut.conf) | Has the initramfs load the policy |
 | [selinuxfs.start](selinuxfs.start) | Mounts selinuxfs at every boot, from `/etc/local.d` |
-| [rc.selinux](rc.selinux) | Run first by s6-linux-init's `rc.init`: mounts selinuxfs and labels `/run` and `/dev` before any service starts |
+| [rc.selinux](rc.selinux) | Run first by s6-linux-init's `rc.init`: mounts selinuxfs and labels `/run`, `/dev` and Apple's firmware before any service starts |
 | [wmutils_s6.te](wmutils_s6.te) | A policy module: what s6 needs and the types borrowed for it do not allow |
 | [enforcing.start](enforcing.start) | Switches to enforcing at every boot, from `/etc/local.d`, unless the boot before it went enforcing and nobody got in |
 
@@ -136,9 +136,9 @@ every one for `unlabeled_t`.
 ### 6. `sudo sh selinux/install.sh relabel`
 
 Labels every file, as the guide has it: first the directories that mounts
-cover (`/dev`, `/proc`, `/run`, `/sys`, `/home`, `/boot/efi`, ...), through
-a second mount of `/`; the swap file as `swapfile_t`; then
-`restorecon -RF /`. Both Btrfs subvolumes are labelled; the vfat ESP
+cover (`/dev`, `/proc`, `/run`, `/sys`, `/home`, `/boot/efi`, ...), each
+through a second mount of the filesystem it is on; the swap file as
+`swapfile_t`; then `restorecon -RF /`. Both Btrfs subvolumes are labelled; the vfat ESP
 cannot hold labels and is skipped.
 
 - A user's FUSE mounts (rclone, the document portal in
@@ -271,19 +271,42 @@ machine booted with it, twice. What `ps -eo label,args` showed:
 ### 8. `sudo sh selinux/install.sh policy`
 
 With the services in their domains the kernel log says what the policy
-would refuse them. The 20 lines the log kept of a boot on 2026-11-16 (it
-drops most: see below) showed four things that this step is for:
+would refuse them. A permissive boot and a login on 2026-11-16, with the
+log's rate limit off (see below), left 127 lines, 67 different things.
+The script of step 9 switches about two seconds into the boot, so most
+of them would have been refused. What they were:
 
-- **s6's catch-all logger.** Every service without a logger of its own
-  writes to `/run/service/s6-svscan-log/fifo`, which it inherits from
-  process 1. The policy lets a daemon write to a pipe an init script made,
-  not to this fifo, nor use a descriptor process 1 opened. Enforcing, the
-  kernel closes such descriptors when the daemon starts.
+- **What everything s6 starts inherits.** The catch-all logger's fifo,
+  `/run/service/s6-svscan-log/fifo`, is the output of process 1 and of
+  every service and oneshot without a logger of its own; the policy lets
+  a daemon write to a pipe an init script made, not to this fifo. The
+  same for `/dev/console` as the kernel opened it, and for the service
+  directory a service runs in. Enforcing, the kernel closes such
+  descriptors when the program starts.
+- **X.** elogind opens the screen and the input devices for the X server
+  and sends the descriptors over the system bus, and the bus daemon may
+  not pass on a DRM or an input device.
+- **Firmware.** On Apple hardware the initramfs copies the vendor
+  firmware from the ESP to a tmpfs on `/usr/lib/firmware/vendor` before
+  any policy is loaded, so its files are `root_t`, and the kernel may
+  load firmware from `lib_t`. Wi-Fi and Bluetooth load theirs again when
+  they are turned on.
 - **`/run/NetworkManager` and `/run/tmpfiles.d`**, which s6-rc's scripts
   make before the daemon runs. The policy gives a directory in `/run` the
   daemon's type when the daemon makes it, and for some names when an init
   script does (`dbus`, `chrony`, `udev`); not for these two, which came
   out `initrc_runtime_t`, where NetworkManager may not write.
+- **elogind**, in the domain the policy has for systemd-logind: watching
+  a session's cgroup, `/proc/pressure`, the boot entries on the ESP, the
+  scheduling of a login; and rtkit asking it to hold a suspend back.
+- **udev**: elogind's `uaccess`, which gives the user at the seat the
+  sound, video and input devices, reading the seat; a rule that gives
+  the backlight's `brightness` to a group.
+- **rclone's FUSE mount**, from a service that runs as the user:
+  fusermount3 hands the descriptor back over a socket the service made,
+  and the directory under the mount had no label at all (`relabel` only
+  got to mount points on `/` before 2026-11-16).
+- **xauth**, which startx has write the server's key to a file in `/tmp`.
 - **`io_uring_setup`.** This kernel asks the policy for a permission of
   its own, `io_uring allowed`. The policy has the permission and gives it
   to no domain, the unconfined ones included.
@@ -293,28 +316,36 @@ drops most: see below) showed four things that this step is for:
 
 The step builds [wmutils_s6.te](wmutils_s6.te) with `checkmodule` and
 `semodule_package`, loads it with `semodule -i` (which builds the whole
-policy again and has the kernel load it), turns `allow_execmem` on for
-good (`setsebool -P`), and relabels the two directories. It also puts
-[rc.selinux](rc.selinux) where step 7 put it again, if that one is older.
-Policy updates from Portage keep the module and the boolean.
+policy again and has the kernel load it), and turns `allow_execmem` on
+for good (`setsebool -P`). It relabels the two directories in `/run`,
+the firmware, and the directories under mount points on other
+filesystems than `/`. It also puts [rc.selinux](rc.selinux), which now
+labels the firmware at every boot, where step 7 put it. Policy updates
+from Portage keep the module and the boolean.
 
-The module gives
-
-- every daemon domain and `getty_t` the catch-all fifo
-  (`initrc_runtime_t`) and the use of process 1's descriptors;
-- `NetworkManager` and `tmpfiles.d`, made by an init script in `/run`,
-  the types `NetworkManager_runtime_t` and `tmpfiles_runtime_t`;
-- the unconfined domains `io_uring_setup`.
+Each rule in the module is for a line of that log, and says which. Two
+are wider than the line: every domain may write to the catch-all fifo
+and use the console descriptor, not only the ones the log named.
 
 `allow_execmem` lets every unconfined program run memory it wrote. The
 desktop needs that; it is also one of the protections SELinux has
 against injected code, and the unconfined domains are without it after
 this.
 
+Twelve of the 67 stay in the log of a boot, all from before the switch:
+s6-linux-init's early getty on tty6 and `restorecon` itself, which start
+while `/dev` and `/run` are being labelled (8); the kernel loading a
+module from the initramfs and the firmware before it is labelled (2);
+and two that go once the step has run (the mount on the unlabelled
+directory, and NetworkManager asking for `CAP_PERFMON`, which it does
+without and the module tells the kernel not to log).
+
 Tried without root on 2026-11-16: the module built, linked with the 68
-policy packages in `/usr/share/selinux/mcs` and expanded to a policy, in which
-`sesearch` finds each of its rules. Not tried: `semodule -i` on the real
-policy store, and a boot with it.
+policy packages in `/usr/share/selinux/mcs` and expanded to a policy, and
+`sesearch` on that policy for each of the 67: 55 allowed, the twelve
+above not. The first version of the module (the fifo for daemons, the
+two directories, io_uring) went through `semodule -i` and a boot. Not
+tried: this version on the real policy store, and a boot with it.
 
 `policy-undo` takes the module out and turns the boolean off.
 
