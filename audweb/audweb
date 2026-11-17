@@ -67,7 +67,12 @@ case $max in
 *[!0-9]* | 0) usage ;;
 esac
 
-for cmd in yt-dlp audacious audtool curl; do
+# The player: wmplayer (Audacious with its own name; the two are not
+# installed together) where there is one. audtool is the same for both.
+player=audacious
+if command -v wmplayer >/dev/null; then player=wmplayer; fi
+
+for cmd in yt-dlp "$player" audtool curl; do
 	command -v "$cmd" >/dev/null || {
 		echo "${0##*/}: $cmd not found" >&2
 		exit 1
@@ -93,12 +98,12 @@ xml() {
 # audtool needs Audacious running, so it is started before yt-dlp's first
 # answer, not after it.
 if ! audtool version >/dev/null 2>&1; then
-	audacious >/dev/null 2>&1 &
+	"$player" >/dev/null 2>&1 &
 	i=0
 	until audtool version >/dev/null 2>&1; do
 		i=$((i + 1))
 		[ $i -lt 100 ] || {
-			echo "${0##*/}: Audacious did not start" >&2
+			echo "${0##*/}: $player did not start" >&2
 			exit 1
 		}
 		sleep 0.1

@@ -118,6 +118,8 @@ pkg_postinst() {
 	elog "/usr/share/doc/${PF}/audweb/README.md*."
 	optfeature "audweb (YouTube and SoundCloud in Audacious)" \
 		"media-sound/audacious media-plugins/audacious-plugins[ffmpeg,http] net-misc/yt-dlp net-misc/curl"
+	optfeature "audweb (YouTube and SoundCloud in wmplayer, instead of Audacious)" \
+		"media-sound/wmplayer net-misc/curl"
 	elog "The kernel patches are not part of this package: see"
 	elog "/usr/share/doc/${PF}/kernel/README.md*."
 }
