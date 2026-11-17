@@ -169,3 +169,8 @@ itself is in the sound, and stays.
   media-sound/audacious ~arm64
   media-plugins/audacious-plugins ~arm64
   ```
+
+  Or, in their place, [wmplayer](https://github.com/mydesktop-formebutucanuse/wmplayer)
+  (`media-sound/wmplayer`), which is Audacious under its own name with these
+  plugins and `audtool` in it: where there is a `wmplayer` command, audweb
+  starts that.
