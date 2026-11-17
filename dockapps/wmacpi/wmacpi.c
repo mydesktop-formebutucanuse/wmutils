@@ -61,6 +61,7 @@ struct dockapp {
     unsigned short height;	/* height of pixmap */
     int screen;			/* current screen */
     int scale;			/* each pixel is drawn as scale x scale pixels */
+    Pixmap background;		/* at a scale above 1, the window's background */
     int tw;			/* text width inside text pixmap */
     int update;			/* need to redraw? */
     int blink;			/* should we blink the LED? (critical battery) */
@@ -135,10 +136,13 @@ static void clear_text_area(void) {
 static void redraw_window(void)
 {
     if (dockapp->update) {
-	if (dockapp->scale > 1)
-	    scale_draw(dockapp->display, dockapp->pixmap, dockapp->win,
+	if (dockapp->scale > 1) {
+	    /* as the window's background: the X server draws it again by
+	     * itself where the window is uncovered (scale.h) */
+	    scale_draw(dockapp->display, dockapp->pixmap, dockapp->background,
 		       64, 64, dockapp->scale);
-	else
+	    scale_show(dockapp->display, dockapp->win, dockapp->background);
+	} else
 	    XCopyArea(dockapp->display, dockapp->pixmap, dockapp->win,
 		      DAGC, 0, 0, 64, 64, 0, 0);
 	dockapp->update = 0;
@@ -167,9 +171,13 @@ static void new_window(char *display, char *name, int argc, char **argv)
     DAMakePixmapFromData(master_xpm, &dockapp->pixmap, &dockapp->mask,
 			 &dockapp->width, &dockapp->height);
     if (dockapp->scale > 1) {
-	/* the pixmap is not the size of the window, so it cannot be its
-	 * background: the window is only drawn by redraw_window() */
-	XSetWindowBackgroundPixmap(dockapp->display, dockapp->win, None);
+	/* the pixmap is not the size of the window: its background is the
+	 * pixmap made as large, by redraw_window() */
+	dockapp->background = scale_background(dockapp->display, 64, 64,
+					       dockapp->scale);
+	scale_draw(dockapp->display, dockapp->pixmap, dockapp->background,
+		   64, 64, dockapp->scale);
+	scale_show(dockapp->display, dockapp->win, dockapp->background);
 	dockapp->mask = scale_mask(dockapp->display, dockapp->mask,
 				   dockapp->width, dockapp->height,
 				   dockapp->scale);
@@ -845,10 +853,12 @@ int main(int argc, char **argv)
 	    XNextEvent(dockapp->display, &event);
 	    switch (event.type) {
 	    case Expose:
-		/* update */
-		dockapp->update = 1;
 		while (XCheckTypedEvent(dockapp->display, Expose, &event));
-		redraw_window();
+		/* at a scale above 1 the X server has drawn the background */
+		if (dockapp->scale == 1) {
+		    dockapp->update = 1;
+		    redraw_window();
+		}
 		break;
 	    case DestroyNotify:
 		XCloseDisplay(dockapp->display);

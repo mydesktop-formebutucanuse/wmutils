@@ -177,6 +177,7 @@ Pixel      bgPixel, fgPixel;
 GC         normalGC;
 Window     iconWin, win;
 int        scale = 1;	/* each pixel is drawn as scale x scale pixels */
+Pixmap     background = None;	/* at a scale above 1, the windows' background */
 
 char *progName;
 char *className = "WMClock";
@@ -440,28 +441,32 @@ int flushExposeEvents(Window w)
    return(i);
 }
 
-/* Draw the clock on a window, at the GUI scale factor */
+/* Draw the clock on a window */
 void drawWindow(Window w, XpmIcon *v)
 {
-   if (scale > 1)
-    {
-       scale_draw(dpy, v->pixmap, w,
-		  v->attributes.width, v->attributes.height, scale);
-    }
-   else
-    {
-       XCopyArea(dpy, v->pixmap, w, normalGC,
-		 0, 0, v->attributes.width, v->attributes.height, 0, 0);
-    }
+   XCopyArea(dpy, v->pixmap, w, normalGC,
+	     0, 0, v->attributes.width, v->attributes.height, 0, 0);
 }
 
 /* (Re-)Draw the main window and the icon window */
 void redrawWindow(XpmIcon *v)
 {
    flushExposeEvents(iconWin);
-   drawWindow(iconWin, v);
    flushExposeEvents(win);
-   drawWindow(win, v);
+   if (scale > 1)
+    {
+       /* At the GUI scale factor, as their background: the X server
+	* draws it again by itself where they are uncovered (scale.h) */
+       scale_draw(dpy, v->pixmap, background,
+		  v->attributes.width, v->attributes.height, scale);
+       scale_show(dpy, iconWin, background);
+       scale_show(dpy, win, background);
+    }
+   else
+    {
+       drawWindow(iconWin, v);
+       drawWindow(win, v);
+    }
 }
 
 /* Get a Pixel for the given color name */
@@ -956,6 +961,18 @@ int main(int argc, char **argv)
    gcValues.graphics_exposures = False;
    normalGC = XCreateGC(dpy, rootWindow, gcMask, &gcValues);
 
+   if (scale > 1)
+    {
+       /* the windows' background, white where the picture does not reach,
+	* as the windows were */
+       background = scale_background(dpy, clockBg.attributes.width,
+				     clockBg.attributes.height, scale);
+       XSetForeground(dpy, normalGC, bgPixel);
+       XFillRectangle(dpy, background, normalGC, 0, 0,
+		      sizeHints.width, sizeHints.height);
+       XSetForeground(dpy, normalGC, fgPixel);
+    }
+
    if (enableShapedWindow)
     {
        shapeMask = XCreateBitmapFromData(dpy, win, (char *)mask_bits,
@@ -1049,7 +1066,8 @@ int main(int argc, char **argv)
 	   switch(event.type)
 	    {
 	     case Expose:
-	       if (0 == event.xexpose.count)
+	       /* at a scale above 1 the X server has drawn the background */
+	       if (0 == event.xexpose.count && scale == 1)
 		{
 		   redrawWindow(&visible);
 		}
