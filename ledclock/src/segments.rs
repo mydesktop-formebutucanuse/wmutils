@@ -32,6 +32,13 @@ const SLANT: f64 = 0.08;
 /// upright, and the bottom to the left.
 pub const LEAN: f64 = SLANT * HEIGHT / 2.0;
 
+/// The columns of the display that digit `i` can touch, from its left
+/// edge at the bottom, which leans to the left, to its right edge at the
+/// top.
+pub fn span(i: usize) -> (f64, f64) {
+    (DIGITS[i] - LEAN, DIGITS[i] + DIGIT + LEAN)
+}
+
 /// The seven segments of a digit, a to g: the middle of each, from the top
 /// left corner of the digit, and whether it lies across.
 ///
@@ -65,8 +72,12 @@ pub fn cover(x: f64, y: f64, pixel: f64, digits: [u8; 4]) -> (f64, f64) {
     // From the distance to the edge of a shape, outside of it.
     let inside = |distance: f64| (0.5 - distance / pixel).clamp(0.0, 1.0);
 
-    // The colon is lit all the time.
-    let mut lit = DOTS.iter().map(|&(cx, cy)| inside((x - cx).hypot(y - cy) - DOT)).fold(0.0, f64::max);
+    // The colon is lit all the time. Its dots are in one column, and only
+    // the pixels near it are measured from them.
+    let mut lit: f64 = 0.0;
+    if (x - DOTS[0].0).abs() < DOT + pixel {
+        lit = DOTS.iter().map(|&(cx, cy)| inside((x - cx).hypot(y - cy) - DOT)).fold(0.0, f64::max);
+    }
     let mut unlit: f64 = 0.0;
     for (&left, &digit) in DIGITS.iter().zip(&digits) {
         if x < left - pixel || x > left + DIGIT + pixel {
@@ -132,5 +143,15 @@ mod tests {
         // The top leans to the right, the bottom to the left.
         assert_eq!(cover(11.0 + LEAN, 0.5, 1.0, [8, 8, 8, 8]).0, 1.0);
         assert_eq!(cover(11.0 - LEAN, 38.5, 1.0, [8, 8, 8, 8]).0, 1.0);
+        // Nothing of a digit is outside its columns, at the top or at the
+        // bottom, and the columns of two digits do not meet.
+        for i in 0..4 {
+            let (left, right) = span(i);
+            let mut digits = [1; 4];
+            digits[i] = 8;
+            assert_eq!(cover(left - 0.5, 38.75, 1.0, digits), (0.0, 0.0));
+            assert_eq!(cover(right + 0.5, 0.25, 1.0, digits), (0.0, 0.0));
+        }
+        assert!((0..3).all(|i| span(i).1 < span(i + 1).0));
     }
 }

@@ -28,12 +28,12 @@ pub const XA_WM_CLASS: Atom = 67;
 pub const PROP_MODE_REPLACE: c_int = 0;
 pub const BUTTON_PRESS_MASK: c_long = 1 << 2;
 pub const BUTTON_RELEASE_MASK: c_long = 1 << 3;
-pub const POINTER_MOTION_MASK: c_long = 1 << 6;
-pub const EXPOSURE_MASK: c_long = 1 << 15;
+pub const BUTTON1_MOTION_MASK: c_long = 1 << 8;
 pub const BUTTON_PRESS: c_int = 4;
 pub const BUTTON_RELEASE: c_int = 5;
 pub const MOTION_NOTIFY: c_int = 6;
-pub const EXPOSE: c_int = 12;
+/// The class of a window that takes input and shows nothing.
+pub const INPUT_ONLY: c_uint = 2;
 /// Shapes of the cursor font (<X11/cursorfont.h>).
 pub const XC_BOTTOM_LEFT_CORNER: c_uint = 12;
 pub const XC_BOTTOM_RIGHT_CORNER: c_uint = 14;
@@ -198,10 +198,37 @@ unsafe extern "C" {
         border: c_ulong,
         background: c_ulong,
     ) -> Window;
+    /// `attributes` is a `XSetWindowAttributes`, only read for the members
+    /// in `valuemask`: null with none.
+    pub fn XCreateWindow(
+        dpy: *mut Display,
+        parent: Window,
+        x: c_int,
+        y: c_int,
+        width: c_uint,
+        height: c_uint,
+        border_width: c_uint,
+        depth: c_int,
+        class: c_uint,
+        visual: *mut Visual,
+        valuemask: c_ulong,
+        attributes: *mut c_void,
+    ) -> Window;
     pub fn XMapWindow(dpy: *mut Display, win: Window) -> c_int;
+    pub fn XMapSubwindows(dpy: *mut Display, win: Window) -> c_int;
+    pub fn XUnmapSubwindows(dpy: *mut Display, win: Window) -> c_int;
     pub fn XMoveResizeWindow(dpy: *mut Display, win: Window, x: c_int, y: c_int, width: c_uint, height: c_uint)
     -> c_int;
     pub fn XSetWindowBackgroundPixmap(dpy: *mut Display, win: Window, pixmap: Pixmap) -> c_int;
+    pub fn XClearArea(
+        dpy: *mut Display,
+        win: Window,
+        x: c_int,
+        y: c_int,
+        width: c_uint,
+        height: c_uint,
+        exposures: Bool,
+    ) -> c_int;
     pub fn XCreateFontCursor(dpy: *mut Display, shape: c_uint) -> Cursor;
     pub fn XDefineCursor(dpy: *mut Display, win: Window, cursor: Cursor) -> c_int;
     pub fn XUndefineCursor(dpy: *mut Display, win: Window) -> c_int;
