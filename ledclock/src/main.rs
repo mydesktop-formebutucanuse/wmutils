@@ -17,7 +17,11 @@
 //!
 //! It wakes once a minute, at the minute, on a timer that follows the wall
 //! clock: the time is right again at once after the machine was suspended
-//! or the clock was set.
+//! or the clock was set. Nothing else wakes it but a pointer that has hold
+//! of the clock: the picture is the window's background, which the X
+//! server puts back by itself, and the X server shows the cursor of a
+//! corner by itself, over a window of the corner's own. Each minute only
+//! the digits that changed are drawn again.
 
 mod face;
 mod segments;
@@ -225,19 +229,42 @@ fn battery_charge(kind: Option<&str>, scope: Option<&str>, capacity: Option<&str
     capacity?.parse::<u8>().ok().map(|percent| percent.min(100))
 }
 
-/// The charge of the machine's battery, in percent; None on a machine
-/// without one.
-fn battery() -> Option<u8> {
-    let mut supplies: Vec<PathBuf> = fs::read_dir(POWER_SUPPLIES).ok()?.flatten().map(|entry| entry.path()).collect();
-    supplies.sort();
-    supplies.iter().find_map(|supply| {
-        let read = |name: &str| fs::read_to_string(supply.join(name)).ok();
-        let (kind, scope, capacity) = (read("type"), read("scope"), read("capacity"));
-        fn trimmed(s: &Option<String>) -> Option<&str> {
-            s.as_deref().map(str::trim)
+/// The machine's battery: its `capacity` file, once it was found among the
+/// power supplies.
+#[derive(Default)]
+struct Battery {
+    capacity: Option<PathBuf>,
+}
+
+impl Battery {
+    /// The charge of the battery, in percent; None on a machine without
+    /// one. Only its own file is read, after the first time: the power
+    /// supplies are looked through again when that file cannot be read.
+    fn charge(&mut self) -> Option<u8> {
+        let known = self.capacity.as_ref().and_then(|path| fs::read_to_string(path).ok());
+        if let Some(percent) = known.as_deref().and_then(|s| s.trim().parse::<u8>().ok()) {
+            return Some(percent.min(100));
         }
-        battery_charge(trimmed(&kind), trimmed(&scope), trimmed(&capacity))
-    })
+        let (capacity, percent) = Battery::find()?;
+        self.capacity = Some(capacity);
+        Some(percent)
+    }
+
+    /// The capacity file of the machine's battery, and what it says.
+    fn find() -> Option<(PathBuf, u8)> {
+        let mut supplies: Vec<PathBuf> =
+            fs::read_dir(POWER_SUPPLIES).ok()?.flatten().map(|entry| entry.path()).collect();
+        supplies.sort();
+        supplies.iter().find_map(|supply| {
+            let read = |name: &str| fs::read_to_string(supply.join(name)).ok();
+            let (kind, scope, capacity) = (read("type"), read("scope"), read("capacity"));
+            fn trimmed(s: &Option<String>) -> Option<&str> {
+                s.as_deref().map(str::trim)
+            }
+            let percent = battery_charge(trimmed(&kind), trimmed(&scope), trimmed(&capacity))?;
+            Some((supply.join("capacity"), percent))
+        })
+    }
 }
 
 /// How far inside its column of letters the eye sees the left edge of
@@ -298,15 +325,21 @@ enum Grip {
     Corner { left: bool, top: bool },
 }
 
+/// How far a corner reaches into a window `width` pixels wide, across and
+/// down.
+fn corner_reach(width: i32) -> i32 {
+    ((CORNER * width as f64 / face::WIDTH).round() as i32).max(MIN_CORNER)
+}
+
 /// What is under the pointer at `x`, `y` of a window of this size.
 fn grip_at(width: i32, height: i32, x: i32, y: i32) -> Grip {
-    let reach = ((CORNER * width as f64 / face::WIDTH).round() as i32).max(MIN_CORNER);
+    let reach = corner_reach(width);
     let (left, right) = (x < reach, x >= width - reach);
     let (top, bottom) = (y < reach, y >= height - reach);
     if (left || right) && (top || bottom) { Grip::Corner { left, top } } else { Grip::Body }
 }
 
-/// The place of a corner's cursor in `Clock::corners`.
+/// The place of a corner in `Clock::corners` and `CORNERS`.
 fn corner_cursor(left: bool, top: bool) -> usize {
     match (top, left) {
         (true, true) => 0,
@@ -314,6 +347,16 @@ fn corner_cursor(left: bool, top: bool) -> usize {
         (false, true) => 2,
         (false, false) => 3,
     }
+}
+
+/// The four corners, left and top, in the order of `corner_cursor`.
+const CORNERS: [(bool, bool); 4] = [(true, true), (false, true), (true, false), (false, false)];
+
+/// The square of a corner in a window of this size, where the pointer
+/// takes hold of the corner: x, y and the length of its side.
+fn corner_square(width: i32, height: i32, left: bool, top: bool) -> (i32, i32, i32) {
+    let reach = corner_reach(width);
+    (if left { 0 } else { width - reach }, if top { 0 } else { height - reach }, reach)
 }
 
 /// The position nearest to `at` where a window `size` pixels long is whole
@@ -421,6 +464,13 @@ fn first_placement(
     (x, y, width)
 }
 
+/// What the clock shows: AM or PM, the four digits, and the charge of the
+/// battery.
+type Text = (Option<&'static str>, [u8; 4], Option<u8>);
+
+/// A part of the window: x, y, width and height.
+type Area = (i32, i32, i32, i32);
+
 struct Clock {
     dpy: *mut Display,
     screen: c_int,
@@ -432,15 +482,20 @@ struct Clock {
     fg: XftColor,
     /// The colour of the LEDs: red, green and blue.
     led: [f64; 3],
-    /// The font of AM and PM, as -font names it.
+    /// The font of AM and PM, as -font names it, and the height of an M
+    /// in it at 100 pixels.
     family: String,
+    sample: f64,
     hours24: bool,
-    /// The cursor over the clock while it is moved, the ones over its
-    /// corners (`corner_cursor`), and the one the window has now: 0 is the
-    /// cursor of the desktop.
+    /// The cursor over the clock while it is moved, and the ones over its
+    /// corners (`corner_cursor`).
     fleur: Cursor,
     corners: [Cursor; 4],
-    cursor: Cursor,
+    /// Windows that take no input of their own and only show a cursor,
+    /// over the four corners (`corner_square`): the X server shows the
+    /// cursor of a corner by itself, and the pointer does not wake ledclock
+    /// on its way over the clock.
+    squares: [Window; 4],
     /// Where the window was put, on the screen.
     x: i32,
     y: i32,
@@ -454,8 +509,13 @@ struct Clock {
     /// the same on a pixmap.
     colors: Vec<[u8; 3]>,
     back: Pixmap,
-    /// The same with the time on it: what the window shows.
+    /// The same with the time on it: the background of the window, which
+    /// the X server puts back by itself where the window is uncovered.
     pixmap: Pixmap,
+    /// What is on `pixmap`, and where its digits start; None when there is
+    /// only the frame and the panel.
+    drawn: Option<Text>,
+    digits_x: i32,
     marker: *mut XftFont,
     /// The width of AM or PM; 0 on a clock of 24 hours.
     marker_width: i32,
@@ -484,22 +544,24 @@ impl Clock {
         -(g.x as i32)
     }
 
-    /// The font `family` at the size where `sample` is `height` pixels
-    /// tall, which is measured on the font at 100 pixels.
-    fn open_font(dpy: *mut Display, screen: c_int, family: &str, sample: &str, height: f64) -> *mut XftFont {
-        let open = |size: f64| {
-            // Grey antialiasing: the colour fringes of subpixel rendering
-            // show on red letters.
-            let pattern = format!("{family}:pixelsize={size:.2}:antialias=true:rgba=none");
-            let name = CString::new(pattern.clone()).unwrap_or_else(|_| die("bad font name"));
-            // SAFETY: valid display and NUL-terminated name.
-            let font = unsafe { XftFontOpenName(dpy, screen, name.as_ptr()) };
-            if font.is_null() {
-                die(&format!("cannot open the font `{pattern}`"));
-            }
-            font
-        };
-        let trial = open(100.0);
+    /// The font `family` at `size` pixels.
+    fn open_font(dpy: *mut Display, screen: c_int, family: &str, size: f64) -> *mut XftFont {
+        // Grey antialiasing: the colour fringes of subpixel rendering show
+        // on red letters.
+        let pattern = format!("{family}:pixelsize={size:.2}:antialias=true:rgba=none");
+        let name = CString::new(pattern.clone()).unwrap_or_else(|_| die("bad font name"));
+        // SAFETY: valid display and NUL-terminated name.
+        let font = unsafe { XftFontOpenName(dpy, screen, name.as_ptr()) };
+        if font.is_null() {
+            die(&format!("cannot open the font `{pattern}`"));
+        }
+        font
+    }
+
+    /// The height of `sample` in the font `family` at 100 pixels: once,
+    /// for every size the window will have.
+    fn measure(dpy: *mut Display, screen: c_int, family: &str, sample: &str) -> f64 {
+        let trial = Clock::open_font(dpy, screen, family, 100.0);
         let mut g = XGlyphInfo::default();
         // SAFETY: valid display and font; the font is not used after it is
         // closed.
@@ -510,11 +572,12 @@ impl Clock {
         if g.height == 0 {
             die(&format!("the font `{family}` has no `{sample}`"));
         }
-        open(100.0 * height / g.height as f64)
+        g.height as f64
     }
 
-    /// Computes the frame and the panel and puts them on `self.back`.
-    /// `smooth` takes nine times as long at a size that needs it.
+    /// Computes the frame and the panel and puts them on `self.back`, and
+    /// draws on them again what was on the window. `smooth` takes nine
+    /// times as long at a size that needs it.
     fn put_face(&mut self, smooth: bool) {
         let (w, h) = (self.width as usize, self.height as usize);
         // At a whole multiple of the design every edge of it falls between
@@ -523,6 +586,9 @@ impl Clock {
         self.rough = !whole && !smooth;
         self.colors = face::render(w, h, if whole || !smooth { 1 } else { 3 });
         self.put_image(self.back, &self.colors, 0, 0, w, h);
+        if let Some(text) = self.drawn.take() {
+            self.draw(text);
+        }
     }
 
     /// Puts a picture `w` pixels wide and `h` high, row by row in `colors`,
@@ -562,13 +628,15 @@ impl Clock {
     }
 
     /// Makes the pixmaps, the font and the picture of the frame for a
-    /// window of this size, in the place of the ones for the size before.
+    /// window of this size, in the place of the ones for the size before,
+    /// with what was on the window drawn on them again.
     fn fit(&mut self, width: i32, height: i32, smooth: bool) {
         let (dpy, screen) = (self.dpy, self.screen);
         let scale = height as f64 / face::HEIGHT;
         // SAFETY: the pixmaps and the font of the size before are freed
         // once, after the first call only, and replaced before anything
-        // draws.
+        // draws. The X server keeps the pixmap that is still the window's
+        // background until the window is given the new one.
         unsafe {
             if !self.marker.is_null() {
                 XftFontClose(dpy, self.marker);
@@ -578,10 +646,14 @@ impl Clock {
             self.back = XCreatePixmap(dpy, self.win, width as c_uint, height as c_uint, self.depth as c_uint);
             self.pixmap = XCreatePixmap(dpy, self.win, width as c_uint, height as c_uint, self.depth as c_uint);
             XftDrawChange(self.draw, self.pixmap);
+            for (&square, &(left, top)) in self.squares.iter().zip(&CORNERS) {
+                let (x, y, side) = corner_square(width, height, left, top);
+                XMoveResizeWindow(dpy, square, x, y, side as c_uint, side as c_uint);
+            }
         }
         (self.width, self.height) = (width, height);
         // A letter that is flat at both ends gives the height.
-        self.marker = Clock::open_font(dpy, screen, &self.family, "M", MARKER_HEIGHT * scale);
+        self.marker = Clock::open_font(dpy, screen, &self.family, 100.0 * (MARKER_HEIGHT * scale) / self.sample);
         self.marker_width = if self.hours24 {
             0
         } else {
@@ -622,9 +694,6 @@ impl Clock {
             let (width, height) = window_size(width as u32);
 
             let win = XCreateSimpleWindow(dpy, root, x, y, width as c_uint, height as c_uint, 0, 0, 0);
-            // No background: the server does not paint the window black
-            // before we paint it at a new size.
-            XSetWindowBackgroundPixmap(dpy, win, 0);
             set_bytes(dpy, win, XA_WM_NAME, XA_STRING, b"ledclock");
             set_bytes(dpy, win, XA_WM_CLASS, XA_STRING, b"ledclock\0Ledclock\0");
             // A dock window: Window Maker gives it no title bar, no border
@@ -644,12 +713,20 @@ impl Clock {
             // Never focused (flags = InputHint, input = False).
             set_longs(dpy, win, XA_WM_HINTS, XA_WM_HINTS, &[1, 0, 0, 0, 0, 0, 0, 0, 0]);
             // The pointer moves the window and changes its size: the window
-            // manager does neither for a dock window.
-            XSelectInput(
-                dpy,
-                win,
-                EXPOSURE_MASK | BUTTON_PRESS_MASK | BUTTON_RELEASE_MASK | POINTER_MOTION_MASK,
-            );
+            // manager does neither for a dock window. Only a pointer that
+            // has hold of the clock is followed; no Expose is asked for, as
+            // the window's background is the picture.
+            XSelectInput(dpy, win, BUTTON_PRESS_MASK | BUTTON_RELEASE_MASK | BUTTON1_MOTION_MASK);
+            let corners = [XC_TOP_LEFT_CORNER, XC_TOP_RIGHT_CORNER, XC_BOTTOM_LEFT_CORNER, XC_BOTTOM_RIGHT_CORNER]
+                .map(|shape| XCreateFontCursor(dpy, shape));
+            // A press on a corner goes on to the window under it, which
+            // asks for it; `fit` puts the corners in their places.
+            let squares = corners.map(|cursor| {
+                let square = XCreateWindow(dpy, win, 0, 0, 1, 1, 0, 0, INPUT_ONLY, ptr::null_mut(), 0, ptr::null_mut());
+                XDefineCursor(dpy, square, cursor);
+                square
+            });
+            XMapSubwindows(dpy, win);
 
             let gc = XCreateGC(dpy, win, 0, ptr::null_mut());
             // No event for every copy of a pixmap that had nothing hidden.
@@ -677,11 +754,11 @@ impl Clock {
                 fg,
                 led: [16, 8, 0].map(|shift| ((opts.color >> shift) & 0xff) as f64),
                 family: opts.font.clone(),
+                sample: Clock::measure(dpy, screen, &opts.font, "M"),
                 hours24: opts.hours24,
                 fleur: XCreateFontCursor(dpy, XC_FLEUR),
-                corners: [XC_TOP_LEFT_CORNER, XC_TOP_RIGHT_CORNER, XC_BOTTOM_LEFT_CORNER, XC_BOTTOM_RIGHT_CORNER]
-                    .map(|shape| XCreateFontCursor(dpy, shape)),
-                cursor: 0,
+                corners,
+                squares,
                 x,
                 y,
                 width,
@@ -690,6 +767,8 @@ impl Clock {
                 colors: Vec::new(),
                 back: 0,
                 pixmap: 0,
+                drawn: None,
+                digits_x: 0,
                 marker: ptr::null_mut(),
                 marker_width: 0,
                 bearing: 0,
@@ -708,53 +787,62 @@ impl Clock {
     }
 
     /// Puts the window at `x`, `y`, `width` pixels wide; `held`, the
-    /// pointer still has hold of it and this is not its last size. True
-    /// when the picture changed: the time has to be painted again.
-    fn place(&mut self, (x, y, width): (i32, i32, i32), held: bool) -> bool {
+    /// pointer still has hold of it and this is not its last size.
+    fn place(&mut self, (x, y, width): (i32, i32, i32), held: bool) {
         if (x, y, width) == (self.x, self.y, self.width) {
-            return !held && self.settle();
+            if !held {
+                self.settle();
+            }
+            return;
         }
         let (width, height) = window_size(width as u32);
-        let mut changed = width != self.width;
-        if changed {
+        let resized = width != self.width;
+        if resized {
             self.fit(width, height, !held);
         } else if !held {
-            changed = self.settle();
+            self.settle();
         }
         (self.x, self.y) = (x, y);
         self.set_size_hints();
-        // SAFETY: valid display and window.
-        unsafe { XMoveResizeWindow(self.dpy, self.win, x, y, width as c_uint, height as c_uint) };
-        changed
-    }
-
-    /// Smooths the picture of a size the pointer has let go of. True when
-    /// there was something to smooth.
-    fn settle(&mut self) -> bool {
-        let rough = self.rough;
-        if rough {
-            self.put_face(true);
-        }
-        rough
-    }
-
-    /// The cursor for what the pointer is over, or has hold of.
-    fn set_cursor(&mut self, grip: Grip, held: bool) {
-        let cursor = match grip {
-            Grip::Corner { left, top } => self.corners[corner_cursor(left, top)],
-            Grip::Body if held => self.fleur,
-            Grip::Body => 0,
-        };
-        if cursor == self.cursor {
-            return;
-        }
-        self.cursor = cursor;
-        // SAFETY: valid display, window and cursor.
+        // SAFETY: valid display, window and pixmap.
         unsafe {
-            if cursor == 0 {
-                XUndefineCursor(self.dpy, self.win);
-            } else {
-                XDefineCursor(self.dpy, self.win, cursor);
+            // The picture of the new size is the background before the
+            // window has that size: the X server puts it there at once.
+            if resized {
+                XSetWindowBackgroundPixmap(self.dpy, self.win, self.pixmap);
+            }
+            XMoveResizeWindow(self.dpy, self.win, x, y, width as c_uint, height as c_uint);
+        }
+    }
+
+    /// Smooths the picture of a size the pointer has let go of.
+    fn settle(&mut self) {
+        if self.rough {
+            self.put_face(true);
+            self.show((0, 0, self.width, self.height));
+        }
+    }
+
+    /// The pointer takes hold of the clock by `grip`, or lets go of it
+    /// (None). While it has hold of it, the cursor over the whole window
+    /// is the one of the grip; then the cursor of the desktop again, and
+    /// over the corners their own.
+    fn hold(&self, grip: Option<Grip>) {
+        // SAFETY: valid display, windows and cursors.
+        unsafe {
+            match grip {
+                Some(grip) => {
+                    let cursor = match grip {
+                        Grip::Corner { left, top } => self.corners[corner_cursor(left, top)],
+                        Grip::Body => self.fleur,
+                    };
+                    XDefineCursor(self.dpy, self.win, cursor);
+                    XUnmapSubwindows(self.dpy, self.win);
+                }
+                None => {
+                    XUndefineCursor(self.dpy, self.win);
+                    XMapSubwindows(self.dpy, self.win);
+                }
             }
         }
     }
@@ -762,19 +850,23 @@ impl Clock {
     /// Puts the display of segments, showing `digits`, on the panel:
     /// `left` is where it starts, standing on the baseline. The segments
     /// that are lit have the colour of the LEDs; the others have a little
-    /// of it, over the panel.
-    fn put_digits(&self, left: i32, digits: [u8; 4]) {
+    /// of it, over the panel. Only the columns that the digits marked in
+    /// `which` can touch are drawn; they are the part of the window that
+    /// changed, if any.
+    fn put_digits(&self, left: i32, digits: [u8; 4], which: [bool; 4]) -> Option<Area> {
+        let first = which.iter().position(|&w| w)?;
+        let last = which.iter().rposition(|&w| w)?;
         let scale = self.height as f64 / face::HEIGHT;
         let top = self.baseline as f64 - segments::HEIGHT * scale;
-        // The pixels the display can touch: it leans, and an edge of it
+        // The pixels the digits can touch: they lean, and an edge of them
         // can be in the middle of a pixel.
-        let lean = (segments::LEAN * scale).ceil() as i32 + 1;
-        let (x0, x1) = (left - lean, left + (segments::WIDTH * scale).ceil() as i32 + lean);
+        let (x0, x1) = (segments::span(first).0, segments::span(last).1);
+        let (x0, x1) = (left + (x0 * scale).floor() as i32 - 1, left + (x1 * scale).ceil() as i32 + 1);
         let (y0, y1) = (top.floor() as i32 - 1, self.baseline + 1);
         let (x0, x1) = (x0.clamp(0, self.width) as usize, x1.clamp(0, self.width) as usize);
         let (y0, y1) = (y0.clamp(0, self.height) as usize, y1.clamp(0, self.height) as usize);
         if x0 == x1 || y0 == y1 {
-            return;
+            return None;
         }
         let mut colors = Vec::with_capacity((x1 - x0) * (y1 - y0));
         for py in y0..y1 {
@@ -787,6 +879,7 @@ impl Clock {
             }
         }
         self.put_image(self.pixmap, &colors, x0, y0, x1 - x0, y1 - y0);
+        Some((x0 as i32, y0 as i32, (x1 - x0) as i32, (y1 - y0) as i32))
     }
 
     /// Draws letters that end at `right`, standing on the line `y`.
@@ -797,9 +890,34 @@ impl Clock {
         unsafe { XftDrawStringUtf8(self.draw, &self.fg, self.marker, x, y, s.as_ptr(), s.len() as c_int) };
     }
 
+    /// Shows `text` on the window: only what changed is drawn again.
+    fn paint(&mut self, text: Text) {
+        if let Some(area) = self.draw(text) {
+            self.show(area);
+        }
+    }
+
+    /// Draws `text` on the picture of the window, and gives the part of it
+    /// that changed: nothing when the picture shows it already, the digits
+    /// that changed when the rest is the same, and else all of it.
+    fn draw(&mut self, text: Text) -> Option<Area> {
+        let area = match self.drawn {
+            Some(drawn) if drawn == text => None,
+            Some((marker, digits, charge)) if (marker, charge) == (text.0, text.2) => {
+                self.put_digits(self.digits_x, text.1, [0, 1, 2, 3].map(|i| digits[i] != text.1[i]))
+            }
+            _ => {
+                self.draw_all(text);
+                Some((0, 0, self.width, self.height))
+            }
+        };
+        self.drawn = Some(text);
+        area
+    }
+
     /// Draws the time over the frame and the panel, and on the left of it
     /// the charge of the battery, over AM or PM.
-    fn paint(&self, marker: Option<&str>, digits: [u8; 4], charge: Option<u8>) {
+    fn draw_all(&mut self, (marker, digits, charge): Text) {
         let (w, h) = (self.width as c_uint, self.height as c_uint);
         // SAFETY: valid display, pixmaps and GC.
         unsafe { XCopyArea(self.dpy, self.back, self.pixmap, self.gc, 0, 0, w, h, 0, 0) };
@@ -818,15 +936,19 @@ impl Clock {
             let line = if marker.is_some() { self.upper } else { self.baseline };
             self.letters(charge, start + column, line);
         }
-        self.put_digits(digits_x, digits);
-        self.show();
+        self.digits_x = digits_x;
+        self.put_digits(digits_x, digits, [true; 4]);
     }
 
-    fn show(&self) {
-        let (w, h) = (self.width as c_uint, self.height as c_uint);
-        // SAFETY: valid display, pixmap, window and GC.
+    /// Shows a part of the picture on the window.
+    fn show(&self, (x, y, w, h): Area) {
+        // SAFETY: valid display, window and pixmap; the area is not empty.
         unsafe {
-            XCopyArea(self.dpy, self.pixmap, self.win, self.gc, 0, 0, w, h, 0, 0);
+            // The picture is given to the window again each time: what is
+            // drawn into a pixmap after it was made a window's background
+            // may not reach the window.
+            XSetWindowBackgroundPixmap(self.dpy, self.win, self.pixmap);
+            XClearArea(self.dpy, self.win, x, y, w as c_uint, h as c_uint, 0);
             XFlush(self.dpy);
         }
     }
@@ -856,15 +978,9 @@ fn main() {
     if timer < 0 {
         die("cannot create a timer");
     }
-    // SAFETY: valid display and window.
-    unsafe {
-        XMapWindow(clock.dpy, clock.win);
-        XFlush(clock.dpy);
-    }
-
-    let mut shown: Option<(Option<&str>, [u8; 4], Option<u8>)> = None;
-    // The window has a new size: the time is painted again.
-    let mut resized = false;
+    let mut battery = Battery::default();
+    // What the clock showed the last time round.
+    let mut shown: Option<Text> = None;
     let mut drag: Option<Drag> = None;
     let mut ev = XEvent::zeroed();
     loop {
@@ -873,17 +989,19 @@ fn main() {
         let (hour, minute) = local_time(now);
         let (marker, digits) = clock_text(hour, minute, opts.hours24);
         // The battery is read again when the minute changes, not for every
-        // move of the pointer over the clock.
-        let charge = match &shown {
-            Some(shown) if (shown.0, shown.1) == (marker, digits) => shown.2,
-            _ => battery(),
+        // move of the pointer that has hold of the clock.
+        let charge = match shown {
+            Some((m, d, charge)) if (m, d) == (marker, digits) => charge,
+            _ => battery.charge(),
         };
         let text = (marker, digits, charge);
-        if resized || shown.as_ref() != Some(&text) {
-            clock.paint(marker, digits, charge);
-            shown = Some(text);
-            resized = false;
+        clock.paint(text);
+        if shown.is_none() {
+            // Once its picture is its background: it appears whole.
+            // SAFETY: valid display and window.
+            unsafe { XMapWindow(clock.dpy, clock.win) };
         }
+        shown = Some(text);
 
         let next = Itimerspec { value: Timespec { sec: now - now.rem_euclid(60) + 60, nsec: 0 }, ..Default::default() };
         let mut fds = [
@@ -900,7 +1018,6 @@ fn main() {
             if XPending(clock.dpy) == 0 {
                 poll(fds.as_mut_ptr(), fds.len() as c_ulong, -1);
             }
-            let mut exposed = false;
             // Where the pointer has dragged the window to. Of the motions
             // that are waiting only the last one counts: the window is not
             // drawn at every size on the way.
@@ -908,11 +1025,12 @@ fn main() {
             while XPending(clock.dpy) > 0 {
                 XNextEvent(clock.dpy, &mut ev);
                 match ev.kind() {
-                    EXPOSE => exposed = true,
+                    // On the window, or on a corner, from which it comes on
+                    // to the window: `x` and `y` are in the window.
                     BUTTON_PRESS if ev.pointer().button == 1 && drag.is_none() => {
                         let p = ev.pointer();
                         let grip = grip_at(clock.width, clock.height, p.x, p.y);
-                        clock.set_cursor(grip, true);
+                        clock.hold(Some(grip));
                         drag = Some(Drag {
                             grip,
                             pointer: (p.x_root, p.y_root),
@@ -923,17 +1041,17 @@ fn main() {
                         });
                     }
                     MOTION_NOTIFY => {
-                        let p = ev.pointer();
-                        match &drag {
-                            Some(drag) => dragged = Some(drag.placement((p.x_root, p.y_root), clock.screen_size())),
-                            None => clock.set_cursor(grip_at(clock.width, clock.height, p.x, p.y), false),
+                        if let Some(drag) = &drag {
+                            let p = ev.pointer();
+                            dragged = Some(drag.placement((p.x_root, p.y_root), clock.screen_size()));
                         }
                     }
                     BUTTON_RELEASE if ev.pointer().button == 1 => {
-                        let p = ev.pointer();
                         if let Some(drag) = drag.take() {
+                            let p = ev.pointer();
                             let placement = drag.placement((p.x_root, p.y_root), clock.screen_size());
-                            resized |= clock.place(placement, false);
+                            clock.place(placement, false);
+                            clock.hold(None);
                             dragged = None;
                             // A click that moved nothing leaves the saved
                             // placement as it is.
@@ -941,19 +1059,12 @@ fn main() {
                                 save_placement(placement);
                             }
                         }
-                        // Over what the pointer is now, in the window as it
-                        // is now.
-                        let (x, y) = (p.x_root - clock.x, p.y_root - clock.y);
-                        clock.set_cursor(grip_at(clock.width, clock.height, x, y), false);
                     }
                     _ => {}
                 }
             }
             if let Some(placement) = dragged {
-                resized |= clock.place(placement, true);
-            }
-            if exposed && !resized {
-                clock.show();
+                clock.place(placement, true);
             }
             XFlush(clock.dpy);
             if fds[1].revents != 0 {
@@ -1073,6 +1184,27 @@ mod tests {
         assert_eq!(grip_at(60, 18, 3, 3), Grip::Corner { left: true, top: true });
         let places = [(true, true), (true, false), (false, true), (false, false)].map(|(l, t)| corner_cursor(l, t));
         assert_eq!({ let mut p = places; p.sort(); p }, [0, 1, 2, 3]);
+        assert_eq!(CORNERS.map(|(l, t)| corner_cursor(l, t)), [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn corner_squares() {
+        // The windows over the corners are where a press takes hold of a
+        // corner, and only there.
+        for (width, height) in [(604, 180), (198, 59), (60, 18), (8192, 2441)] {
+            for (left, top) in CORNERS {
+                let (x, y, side) = corner_square(width, height, left, top);
+                let corner = Grip::Corner { left, top };
+                for (px, py) in [(x, y), (x + side - 1, y), (x, y + side - 1), (x + side - 1, y + side - 1)] {
+                    assert_eq!(grip_at(width, height, px, py), corner, "{width} {px},{py}");
+                }
+                let outside = if left { x + side } else { x - 1 };
+                assert_eq!(grip_at(width, height, outside, y), Grip::Body, "{width}");
+                let outside = if top { y + side } else { y - 1 };
+                assert_eq!(grip_at(width, height, x, outside), Grip::Body, "{width}");
+            }
+        }
+        assert_eq!(corner_square(604, 180, false, false), (564, 140, 40));
     }
 
     #[test]

@@ -71,7 +71,12 @@ drawn from has them, and in the system's monospace font without it.
 
 ledclock wakes once a minute, at the minute. Its timer follows the wall
 clock, so the time is right at once after the machine was suspended or the
-clock was set.
+clock was set. Nothing else wakes it but the pointer that has hold of it:
+the picture is the window's background, which the X server puts back by
+itself where a window moved off the clock, and the corners are small
+windows of their own, whose cursor the X server shows by itself. Of the
+time, only the digits that changed are drawn again, and of the power
+supplies only the battery's charge is read, once it was found.
 
 No crate dependencies: only libX11 and libXft are linked.
 
