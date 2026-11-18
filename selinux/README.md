@@ -9,6 +9,7 @@ is a way back (see [What enforcing covers](#what-enforcing-covers)).
 | File | What it is |
 |---|---|
 | [install.sh](install.sh) | The steps: `status`, `profile`, `packages`, `boot`, `relabel`, `s6`, `policy`, `denials`, `enforcing`, their `-undo`, `remove` |
+| [trial.sh](trial.sh) | Does what the machine does every day, one thing after another, and says what SELinux refused each; with `-e`, enforcing for as long as it runs |
 | [make.defaults](make.defaults) | For the Portage profile: one policy store, `mcs` |
 | [dracut.conf](dracut.conf) | Has the initramfs load the policy |
 | [selinuxfs.start](selinuxfs.start) | Mounts selinuxfs at every boot, from `/etc/local.d` |
@@ -28,8 +29,14 @@ both orders work. `remove` has only run on a copy of `/etc`.
 **Step 7, the one for s6, ran on 2026-11-16** and has been through two
 boots: init, the services and the logins run in the policy's domains.
 
-**Steps 8 and 9, the policy module and enforcing, have not run on it
-yet.** They were tried without root; each step says how.
+**Step 8, the policy module, ran on 2026-11-16** too, twice, with a boot
+after each: the log of what the policy would refuse went from 127 lines
+to 12, nine of them from before the switch of step 9.
+
+**Enforcing was tried at run time** the same evening, with
+[trial.sh](trial.sh): everything it does worked. **Step 9, enforcing at
+boot, ran after that**, and the machine has booted enforcing once.
+
 
 ## How it was
 
@@ -301,11 +308,27 @@ of them would have been refused. What they were:
   scheduling of a login; and rtkit asking it to hold a suspend back.
 - **udev**: elogind's `uaccess`, which gives the user at the seat the
   sound, video and input devices, reading the seat; a rule that gives
-  the backlight's `brightness` to a group.
+  the backlight's `brightness` to a group; and the rule of
+  [ecores](../ecores) that runs `ecores.sh` when the charger is plugged
+  in or out. udev may run a program, and a file in `/usr/local/share` is
+  data to the policy (`usr_t`): the script would not have run.
 - **rclone's FUSE mount**, from a service that runs as the user:
   fusermount3 hands the descriptor back over a socket the service made,
   and the directory under the mount had no label at all (`relabel` only
   got to mount points on `/` before 2026-11-16).
+- **Portage's second build directory.** `/etc/portage/env` here sets
+  `PORTAGE_TMPDIR=/var/tmp/notmpfs` for the packages too large for the
+  tmpfs on `/var/tmp/portage`: rust, gcc, the kernel, the browsers. The
+  policy knows `/var/tmp/portage` and leaves everything else in
+  `/var/tmp` without a label, and a build may not write where there is
+  none: enforcing, none of those packages would build, the kernel
+  included.
+- **The crates of a live ebuild.** `cargo.eclass` keeps them in
+  `DISTDIR/cargo-registry`, and the build writes there. The policy has a
+  type for what a build fetches for itself, `portage_srcrepo_t`, and
+  gives it to `git3-src` and the like in `DISTDIR`, not to this
+  directory. And a build started from a terminal has that terminal for
+  its input, a descriptor of the user's shell.
 - **xauth**, which startx has write the server's key to a file in `/tmp`.
 - **`io_uring_setup`.** This kernel asks the policy for a permission of
   its own, `io_uring allowed`. The policy has the permission and gives it
@@ -317,10 +340,19 @@ of them would have been refused. What they were:
 The step builds [wmutils_s6.te](wmutils_s6.te) with `checkmodule` and
 `semodule_package`, loads it with `semodule -i` (which builds the whole
 policy again and has the kernel load it), and turns `allow_execmem` on
-for good (`setsebool -P`). It relabels the two directories in `/run`,
+for good (`setsebool -P`). It gives `ecores.sh` the file context of a
+program (`bin_t`) with `semanage fcontext`, as step 7 does for s6's
+files, and every `PORTAGE_TMPDIR` that `/etc/portage/make.conf` or
+`/etc/portage/env` sets, other than `/var/tmp`, the contexts the policy
+has for `/var/tmp` and `/var/tmp/portage` (`tmp_t` for the directory if
+it has none, `portage_tmp_t` for `portage` in it). Run it again after
+adding such a directory. `DISTDIR/cargo-registry` gets
+`portage_srcrepo_t`. It relabels the two directories in `/run`,
 the firmware, and the directories under mount points on other
 filesystems than `/`. It also puts [rc.selinux](rc.selinux), which now
-labels the firmware at every boot, where step 7 put it. Policy updates
+labels the firmware at every boot, where step 7 put it. It keeps the
+module's source as `/etc/selinux/wmutils_s6.te`, by which `status` and
+step 9 tell whether the policy has the module as it is here. Policy updates
 from Portage keep the module and the boolean.
 
 Each rule in the module is for a line of that log, and says which. Two
@@ -340,14 +372,38 @@ and two that go once the step has run (the mount on the unlabelled
 directory, and NetworkManager asking for `CAP_PERFMON`, which it does
 without and the module tells the kernel not to log).
 
-Tried without root on 2026-11-16: the module built, linked with the 68
-policy packages in `/usr/share/selinux/mcs` and expanded to a policy, and
-`sesearch` on that policy for each of the 67: 55 allowed, the twelve
-above not. The first version of the module (the fifo for daemons, the
-two directories, io_uring) went through `semodule -i` and a boot. Not
-tried: this version on the real policy store, and a boot with it.
+Each version of the module was first tried without root: built, linked
+with the 68 policy packages in `/usr/share/selinux/mcs` and expanded to a
+policy, and `sesearch` on that policy for each line of the log. For the
+67: 55 allowed, the twelve above not.
 
-`policy-undo` takes the module out and turns the boolean off.
+What ran on the machine, all on 2026-11-16: version 1.0 (the fifo for
+daemons, the two directories, io_uring) and a boot; then 1.1, from the
+127 lines, and a boot. The log of that boot, a login and the charger
+plugged in had 12 lines: nine from before the switch (the early getty 7,
+`restorecon` 1, the module from the initramfs 1; the firmware one was
+gone, labelled by the hook before anything loaded it), and three new
+ones, udev running `ecores.sh`. Version 1.2 and the file context are for
+those three, and went into the policy the same evening; no boot with
+them yet. That log is of two
+minutes: no suspend, no Wi-Fi or Bluetooth turned off and on, no
+`emerge`. A third, taken while `emerge` built a Rust program in
+`/var/tmp/notmpfs`, had 906 lines and nothing else: `dir { write }` on
+the unlabelled build directory 897 times in 28 seconds, which pushed
+everything older out of the kernel's log. The contexts for
+`PORTAGE_TMPDIR` are for that, and went in the same evening. metalog's
+copy of the kernel log had the rest of that build (17,528 lines from
+eight minutes, 17,387 of them that one): the crates, the terminal, and
+`semodule` and `semanage` themselves, which ask every filesystem for its
+room (allowed in 1.3) and relabel the files of the policy store from the
+user that ran them to `system_u`, which the policy lets nothing but a
+few domains do. Left as it is: whether `semodule -i` works without is
+for the trial of step 9 to show. 1.3 and the context for the crates
+have not run on the machine yet. `semodule -i` has the kernel forget what it has already
+logged, so after the step everything is logged anew without a reboot.
+
+`policy-undo` takes the module out, turns the boolean off and removes
+the file context.
 
 ### Looking at what it would refuse
 
@@ -358,8 +414,21 @@ sudo sh selinux/install.sh denials
 No auditd runs under s6, so the denials go to the kernel log, which is
 root's to read. The step prints one line for each thing refused: how
 often, the domain, the type and class it was refused on, what, the
-command, and the file if the kernel named one. `denials raw` prints the
-lines as the kernel logged them, for `audit2allow -i`.
+command and the file (if the kernel named one) of the first time.
+`denials raw` prints the lines as the kernel logged them, for
+`audit2allow -i`.
+
+The kernel's log has room for 256 KiB here, some 900 denials, and loses
+the oldest. A system logger keeps a copy: with files or directories
+after it, `denials` reads those and not the kernel's log, a directory's
+files oldest first, the boots before this one with them.
+
+```sh
+sudo sh selinux/install.sh denials /var/log/kernel
+```
+
+is metalog's. The step says so when the kernel's log no longer begins
+at the boot.
 
 The kernel prints audit records through a rate limit, ten lines in five
 seconds, and a boot has hundreds: on 2026-11-16 the record numbers went
@@ -368,10 +437,57 @@ limit off (`kernel.printk_ratelimit=0`) at the start of a boot that is
 permissive, and the script of step 9 puts it back when it switches.
 
 In permissive mode the kernel logs each thing once for a domain: it
-remembers that it let it pass. So the log of a boot is the list, and it
+remembers that it let it pass, for as long as it has room to (a build
+that touches many types had it log the same thing hundreds of times).
+So the log of a boot is the list, and it
 has only what was done since: before enforcing, do what the machine does every
 day (suspend and resume, a network that comes and goes, Bluetooth, sound,
 `emerge`, `emerge --config sys-kernel/asahi-kernel`) and read it again.
+
+### Trying it: `sudo sh selinux/trial.sh`
+
+Waiting for a day's use to show what the policy refuses takes a day, and
+a build filled the kernel's log before the rest could be read. The trial
+does the things one after another: the user asking elogind,
+NetworkManager, bluetoothd and chronyd something; udev running
+`ecores.sh` for the power supply and its rules for the backlight, input
+and sound; s6 restarting chronyd, bluetoothd, metalog, rclone, a getty
+and NetworkManager, each of which has to come up again in its domain;
+Wi-Fi and Bluetooth off and on; a quiet tone; to another console and
+back, which takes X's devices away and returns them; the policy built
+again; a small package built and merged in each of Portage's build
+directories; and to sleep through elogind (the machine has no alarm to
+wake it: a key does). `sh selinux/trial.sh -l` lists them, and tests
+named after the options run alone.
+
+It copies the kernel's log from `/dev/kmsg` while it runs, with the
+kernel's limits off, and writes its own lines there to tell which test a
+denial fell into. The report is a table of the tests (worked or not,
+denials) and the summary `denials` gives, in a directory of its own.
+
+Without `-e` SELinux stays as it is: permissive, the policy is loaded
+again before each test so the kernel logs everything anew. With `-e` the
+script switches to enforcing for the tests and back at its end, on a
+signal and when its terminal goes; a process of its own switches back
+after 900 seconds (`-t`) if the script cannot. At the end it waits for
+the two things it cannot do: `sudo` with the password, and a login on
+another console. `kernel`, which is `emerge --config
+sys-kernel/asahi-kernel`, runs only when named and never with `-e`: a
+kernel image half written is a machine that does not boot.
+
+It ran on the machine on 2026-11-16, permissive, with module 1.3: every
+test worked, `emerge` in a run of its own after another emerge had
+ended. The denials were `semodule`'s own, the relabelling of the policy
+store that step 8 tells of, and emerge binding a socket to `::1` to see
+whether there is IPv6, which 1.4 allows.
+
+Then with `-e`, with 1.4: all twelve worked enforcing, `sudo` and the
+login on another console with them. Two things were refused and did no
+harm, and 1.5 tells the kernel not to log them: NetworkManager asking
+for `CAP_SYS_ADMIN` (six lines each time it starts), and `semodule`
+giving the files of the policy it built the user `system_u` (312 lines
+each time): the files keep the user of who ran the command, and the
+policy loads.
 
 ### 9. `sudo sh selinux/install.sh enforcing`
 
@@ -413,7 +529,14 @@ back to permissive at once. `s6-undo` and `policy-undo` do that first.
 Tried without root on 2026-11-16, on copies of the paths: not armed;
 armed with nobody logged in (the mark stays, and the next run does not
 switch); armed with a user logged in (the mark goes after the wait).
-Not tried: the step as root, and a boot.
+
+The step ran on the machine that evening, after the trial, and the boot
+after it came up enforcing: the automatic login and X, the services in
+their domains, the network connected, rclone's mount there, and the
+mark gone 36 seconds into the boot. `denials` after it had nine lines,
+the nine from before the switch that step 8 tells of, and nothing
+refused. Not seen: a boot that enforcing breaks, and so the permissive
+boot after it.
 
 ## What enforcing covers
 

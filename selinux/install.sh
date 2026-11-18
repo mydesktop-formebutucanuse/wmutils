@@ -41,6 +41,9 @@ mark='# wmutils: selinux'
 # code it wrote to memory, which every JIT compiler does.
 module=wmutils_s6
 bool=allow_execmem
+# The source of the module as the policy step loaded it: what tells that
+# step whether it has run for this version.
+loaded=/etc/selinux/$module.te
 # The enforcing step: the script that switches at boot, the file that tells
 # it to, and the mark it leaves until a user is logged in.
 enforce=/etc/local.d/wmutils-selinux-enforcing.start
@@ -170,6 +173,7 @@ has_context() {
 		$1 == ENVIRON["P"] {
 			c = $2
 			if (ENVIRON["K"] == "f") c = ($2 == "--") ? $3 : ""
+			if (ENVIRON["K"] == "d") c = ($2 == "-d") ? $3 : ""
 			if (split(c, part, ":") >= 3 && part[3] == ENVIRON["T"]) found = 1
 		}
 		END { exit !found }' "$contexts.local" 2>/dev/null
@@ -187,6 +191,57 @@ s6_hooked() {
 	[ -x "$hook" ] && grep -q " $mark\$" "$rcinit"
 }
 
+# The file contexts of the policy step, as s6_contexts has them: programs
+# that a confined domain runs from where the policy takes files for data.
+# - ecores.sh, which udev runs when the charger is plugged in or out
+#   (ecores/): udev may run a program (bin_t), not a file in /usr/share.
+# - A build directory of Portage's that is not /var/tmp/portage, the only
+#   one the policy knows: the build's domain may not write to a directory
+#   without a label, which anything else in /var/tmp is.
+# - The registry of crates that cargo.eclass keeps in DISTDIR for live
+#   ebuilds: the build writes to it, as it does to git3-src beside it,
+#   for which the policy has the type; the rest of DISTDIR is not the
+#   build's to write.
+policy_contexts() {
+	printf '%s\n' \
+		"bin_t f /usr/local/share/wmutils/ecores/ecores\.sh" \
+		"portage_srcrepo_t a $(regex "$(distdir)")/cargo-registry(/.*)?"
+	portage_tmpdirs | while read -r d; do
+		if [ "$(matchpathcon -n "$d" 2>/dev/null)" = '<<none>>' ] ||
+			has_context tmp_t d "$(regex "$d")"; then
+			echo "tmp_t d $(regex "$d")"
+		fi
+		echo "portage_tmp_t a $(regex "$d")/portage(/.*)?"
+	done
+}
+
+# Portage's DISTDIR.
+distdir() {
+	if [ -z "${distdir:-}" ]; then
+		distdir=$(portageq envvar DISTDIR 2>/dev/null) || distdir=
+		: "${distdir:=/var/cache/distfiles}"
+	fi
+	echo "${distdir%/}"
+}
+
+# PORTAGE_TMPDIR where /etc/portage sets it to something else than
+# /var/tmp, as an env file does for the packages too large for a tmpfs.
+portage_tmpdirs() {
+	grep -rhs '^[[:space:]]*PORTAGE_TMPDIR=' /etc/portage/make.conf /etc/portage/env |
+		sed 's/^[^=]*=//; s/[[:space:]]*#.*$//; s/^["'\'']//; s/["'\'']$//; s:/*$::' |
+		sort -u | while read -r d; do
+			case $d in
+			/var/tmp | /tmp) ;;
+			/?*) echo "$d" ;;
+			esac
+		done
+}
+
+# The path a pattern of policy_contexts is for.
+unregex() {
+	printf '%s\n' "$1" | sed 's/(\/\.\*)?$//; s/\\\(.\)/\1/g'
+}
+
 # Is our policy module in the policy? Root asks the policy store; anyone
 # else asks the loaded policy for one of the module's rules.
 module_loaded() {
@@ -195,6 +250,15 @@ module_loaded() {
 	else
 		sesearch -A -s getty_t -t initrc_runtime_t -c fifo_file -p write 2>/dev/null | grep -q allow
 	fi
+}
+
+# Has the policy step run for the module and the file contexts as they
+# are here?
+policy_current() {
+	cmp -s "$here/$module.te" "$loaded" || return 1
+	policy_contexts | while read -r t k p; do
+		has_context "$t" "$k" "$p" || exit 1
+	done
 }
 
 bool_on() {
@@ -231,10 +295,18 @@ policy_undo() {
 		semodule -r "$module"
 		echo "took the policy module $module out"
 	fi
+	rm -f "$loaded"
 	if bool_on; then
 		setsebool -P "$bool" off
 		echo "$bool is off again"
 	fi
+	policy_contexts | while read -r t k p; do
+		has_context "$t" "$k" "$p" || continue
+		semanage fcontext --delete --ftype "$k" "$p" </dev/null
+		echo "file context: $p is the policy's own again"
+		f=$(unregex "$p")
+		[ ! -e "$f" ] || restorecon -F "$f"
+	done
 }
 
 # Undoes the s6 step: our line in rc.init, our script, the file contexts
@@ -359,6 +431,7 @@ status)
 	fi
 	pol_m=$(yesno module_loaded)
 	pol_b=$(yesno bool_on)
+	pol_c=$(yesno policy_current)
 	e_armed=$(yesno sh -c '[ -x "$1" ] && [ -e "$2" ]' sh "$enforce" "$want")
 	e_failed=$(yesno test -e "$trying")
 	echo "kernel   built with SELinux: $k_built; on now: $k_on; policy loaded: $k_policy${mode:+ ($mode)}"
@@ -370,7 +443,7 @@ status)
 	if [ "$s6" = yes ]; then
 		echo "s6        init, s6-supervise and rc.init have the policy's types: $s6_l; rc.init labels /run and /dev: $s6_h"
 		echo "          init runs as: ${pid1:-(no label)}"
-		echo "policy    module $module: $pol_m; $bool: $(if [ "$pol_b" = yes ]; then echo on; else echo off; fi)"
+		echo "policy    module $module: $pol_m; as it is here, with its file contexts: $pol_c; $bool: $(if [ "$pol_b" = yes ]; then echo on; else echo off; fi)"
 		echo "enforcing at boot: $e_armed${mode:+; now: $mode}"
 	fi
 	if [ -e "$oldorig" ] || [ -e "$olddracutconf" ] || [ -e "$oldstart" ]; then
@@ -407,7 +480,7 @@ status)
 	elif [ "$s6" = yes ] && [ "${pid1#*:init_t:}" = "$pid1" ]; then
 		echo "SELinux is on, $mode, and the files are labelled."
 		echo "Next: a reboot, after which init, the services and the logins run in the policy's domains."
-	elif [ "$s6" = yes ] && { [ "$pol_m" = no ] || [ "$pol_b" = no ]; }; then
+	elif [ "$s6" = yes ] && { [ "$pol_m" = no ] || [ "$pol_b" = no ] || [ "$pol_c" = no ]; }; then
 		echo "SELinux is on, $mode, the files are labelled and init runs as init_t."
 		echo "Next: sudo sh $0 policy"
 	elif [ "$s6" = yes ] && [ "$e_armed" = no ]; then
@@ -660,11 +733,27 @@ policy)
 	semodule -i "$tmp/$module.pp"
 	rm -rf "$tmp"
 	trap - EXIT
+	install -m 644 "$here/$module.te" "$loaded"
 	echo "the policy module $module is in the policy"
 	if ! bool_on; then
 		setsebool -P "$bool" on
 	fi
 	echo "$bool is on"
+	policy_contexts | while read -r t k p; do
+		f=$(unregex "$p")
+		if ! has_context "$t" "$k" "$p"; then
+			semanage fcontext --add --seuser system_u --type "$t" --ftype "$k" "$p" </dev/null 2>/dev/null ||
+				semanage fcontext --modify --seuser system_u --type "$t" --ftype "$k" "$p" </dev/null
+			echo "file context: $p is $t"
+		fi
+		# The directory alone where the context is for a directory:
+		# what is in it has a context of its own.
+		if [ "$k" = a ]; then
+			[ ! -e "$f" ] || restorecon -RF "$f"
+		else
+			[ ! -e "$f" ] || restorecon -F "$f"
+		fi
+	done
 	# What the scripts made in /run before the module said which type.
 	for d in /run/NetworkManager /run/tmpfiles.d; do
 		[ ! -e "$d" ] || restorecon -RF "$d"
@@ -680,7 +769,7 @@ policy)
 		restorecon -F "$hook"
 		echo "installed $hook again: it was an older one"
 	fi
-	echo "SELinux stays $(mode_now). After the next boot the kernel log has every denial:"
+	echo "SELinux stays $(mode_now). The kernel logs every denial anew from here, and after a boot those of the boot:"
 	echo "  sudo sh $0 denials"
 	;;
 policy-undo)
@@ -690,14 +779,51 @@ policy-undo)
 	;;
 denials)
 	[ "$(id -u)" -eq 0 ] || die "Run as root (the kernel log is root's): sudo sh $0 denials"
-	if [ "${2:-}" = raw ]; then
-		dmesg | grep 'avc: ' || true
+	shift
+	raw=no
+	if [ "${1:-}" = raw ]; then
+		raw=yes
+		shift
+	fi
+	# The kernel's own log, or the files named, oldest first for a
+	# directory: the copy a system logger keeps (metalog's is
+	# /var/log/kernel) has what the kernel's log no longer has room for.
+	if [ $# -gt 0 ]; then
+		from=files
+		one() {
+			case $1 in
+			*.gz) gzip -dc "$1" ;;
+			*.xz) xz -dc "$1" ;;
+			*.zst) zstd -dcq "$1" ;;
+			*.bz2) bzip2 -dc "$1" ;;
+			*) cat "$1" ;;
+			esac
+		}
+		# A logger's file may have bytes that are not text in it: NUL
+		# where a write was cut short by a crash.
+		log() {
+			for a; do
+				if [ -d "$a" ]; then
+					ls -tr "$a" | while read -r f; do
+						[ ! -f "$a/$f" ] || one "$a/$f"
+					done
+				else
+					one "$a"
+				fi
+			done | tr -d '\000'
+		}
+	else
+		from=kernel
+		log() { dmesg; }
+	fi
+	if [ "$raw" = yes ]; then
+		log "$@" | grep -a 'avc: ' || true
 		exit 0
 	fi
 	# One line for each thing refused: how often, the domain, the type
-	# and class it was refused on, what was refused, the command, and
-	# the file if the kernel named one.
-	dmesg | awk '
+	# and class it was refused on, what was refused, and the command
+	# and the file (if the kernel named one) of the first time.
+	log "$@" | awk -v from="$from" -v self="$0" '
 		function val(k,    m) {
 			if (!match($0, " " k "=[^ ]*")) return ""
 			m = substr($0, RSTART + length(k) + 2, RLENGTH - length(k) - 2)
@@ -708,6 +834,9 @@ denials)
 			split(val(k), a, ":")
 			return a[3]
 		}
+		NR == 1 && from == "kernel" && match($0, /^\[ *[0-9]+\./) {
+			begins = substr($0, 2, RLENGTH - 2) + 0
+		}
 		/kauditd_printk_skb: [0-9]+ callbacks suppressed/ {
 			for (i = 1; i < NF; i++) if ($i == "kauditd_printk_skb:") lost += $(i + 1)
 		}
@@ -717,18 +846,25 @@ denials)
 			sub(/ *\}.*/, "", perms)
 			obj = val("path")
 			if (obj == "") obj = val("name")
-			key = sprintf("%s -> %s : %s { %s }  %s  %s", typ("scontext"), typ("tcontext"), val("tclass"), perms, val("comm"), obj)
-			if (!(key in n)) order[++lines] = key
+			key = sprintf("%s -> %s : %s { %s }", typ("scontext"), typ("tcontext"), val("tclass"), perms)
+			if (!(key in n)) {
+				order[++lines] = key
+				first[key] = val("comm") "  " obj
+			}
 			n[key]++
 			total++
 			if (val("permissive") == "0") refused++
 		}
 		END {
-			for (i = 1; i <= lines; i++) printf "%4d  %s\n", n[order[i]], order[i]
-			printf "%d denials since the boot, %d of them refused (enforcing), %d different.\n", total, refused, lines
+			for (i = 1; i <= lines; i++) printf "%5d  %s  %s\n", n[order[i]], order[i], first[order[i]]
+			printf "%d denials %s, %d of them refused (enforcing), %d different.\n", total, from == "kernel" ? "since the boot" : "in those files", refused, lines
+			if (begins > 1) {
+				printf "The kernel log begins %d seconds into the boot: it had no room for what was before.\n", begins
+				printf "The system logger may have it: sudo sh %s denials /var/log/kernel\n", self
+			}
 			if (lost) printf "The kernel left %d lines out of its log (rate limit); not all of them were denials.\n", lost
 		}'
-	echo "Every line as the kernel logged it: sudo sh $0 denials raw"
+	echo "Every line as the kernel logged it: sudo sh $0 denials raw${1:+ $*}"
 	;;
 enforcing)
 	need_root
@@ -738,6 +874,7 @@ enforcing)
 	pid1=$(tr -d '\0\n' </proc/1/attr/current 2>/dev/null) || pid1=
 	[ "${pid1#*:init_t:}" != "$pid1" ] || die "init does not run as init_t yet: a reboot first."
 	module_loaded && bool_on || die "The policy module and the boolean first: sudo sh $0 policy"
+	policy_current || die "The policy module in the policy is an older one than $here/$module.te: sudo sh $0 policy"
 	cmp -s "$here/rc.selinux" "$hook" || die "$hook is an older one: sudo sh $0 policy"
 	[ -d "${enforce%/*}" ] || die "There is no ${enforce%/*}, whose *.start scripts s6-rc's init-local runs at boot."
 	install -m 755 "$here/enforcing.start" "$enforce"
