@@ -1,0 +1,293 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# wmutils: what s6 and this machine need of the policy, and the policy for
+# OpenRC and the types selinux/install.sh s6 borrows do not allow. Built and
+# loaded by selinux/install.sh policy. Each rule is for a denial in the
+# kernel log of a permissive boot. See selinux/README.md.
+module wmutils_s6 1.6;
+
+require {
+	type init_t;
+	type initrc_t;
+	type initrc_runtime_t;
+	type kernel_t;
+	type var_run_t;
+	attribute daemon;
+	attribute domain;
+	attribute unconfined_domain_type;
+	class capability sys_admin;
+	class capability2 perfmon;
+	class chr_file { read write };
+	class dbus send_msg;
+	class dir { getattr mounton open read relabelfrom relabelto search write };
+	class fd use;
+	class fifo_file { append getattr ioctl lock write };
+	class file { getattr open read relabelfrom relabelto setattr unlink watch write };
+	class filesystem getattr;
+	class io_uring allowed;
+	class process { getsched setsched };
+	class tcp_socket node_bind;
+	class udp_socket node_bind;
+	class unix_stream_socket { getattr read write };
+}
+
+# What everything s6 starts inherits. Enforcing, the kernel closes a
+# descriptor the new program's domain may not use, and what the program
+# says is lost.
+# - /run/service/s6-svscan-log/fifo, the catch-all logger: the output of
+#   process 1 and so of every service and oneshot without a logger of its
+#   own. The policy lets a daemon write to a pipe an init script made, not
+#   to this fifo, which is a file in /run.
+# - The descriptors process 1 opened, and /dev/console, which the kernel
+#   opened for it.
+# - The service directory in /run/service, which is where a service runs.
+allow daemon init_t:fd use;
+allow domain kernel_t:fd use;
+allow domain initrc_runtime_t:fifo_file { append getattr ioctl lock write };
+allow domain initrc_runtime_t:dir { getattr search };
+
+# Directories in /run that a run script or a oneshot makes before the
+# daemon starts. The policy gives them the daemon's type only when the
+# daemon makes them itself; made by a script they would be
+# initrc_runtime_t, where the daemon may not write.
+optional {
+	require {
+		type NetworkManager_runtime_t;
+	}
+	type_transition initrc_t var_run_t:dir NetworkManager_runtime_t "NetworkManager";
+}
+optional {
+	require {
+		type tmpfiles_runtime_t;
+	}
+	type_transition initrc_t var_run_t:dir tmpfiles_runtime_t "tmpfiles.d";
+}
+
+# io_uring_setup(2). The kernel asks for this permission, and the policy
+# of 2.20260616 has it and gives it to no domain, the unconfined ones
+# included: enforcing, no program could set up an io_uring.
+allow unconfined_domain_type self:io_uring allowed;
+
+# The X server gets its devices from elogind, which opens them and sends
+# the descriptors over the system bus: the bus daemon has to be allowed
+# what it passes on. Without this X has no screen and no input.
+optional {
+	require {
+		type system_dbusd_t;
+		type dri_device_t;
+		type event_device_t;
+	}
+	allow system_dbusd_t { dri_device_t event_device_t }:chr_file { read write };
+}
+
+# elogind, in the domain the policy has for systemd-logind:
+# - it watches the cgroup of a session for becoming empty;
+# - it reads /proc/pressure, and the boot loader entries on the ESP, which
+#   it looks for when asked what a reboot can boot into;
+# - it sets the scheduling of the login it makes a session for.
+optional {
+	require {
+		type systemd_logind_t;
+		type cgroup_t;
+		type dosfs_t;
+		type local_login_t;
+		type proc_psi_t;
+	}
+	allow systemd_logind_t cgroup_t:file watch;
+	allow systemd_logind_t dosfs_t:dir { getattr open read search };
+	allow systemd_logind_t dosfs_t:file { getattr open read };
+	allow systemd_logind_t proc_psi_t:dir search;
+	allow systemd_logind_t proc_psi_t:file { getattr open read };
+	allow systemd_logind_t local_login_t:process setsched;
+}
+
+# rtkit asks elogind to hold a suspend back until it has taken the
+# real-time priorities away, and holds the pipe elogind gives it for that.
+optional {
+	require {
+		type rtkit_daemon_t;
+		type systemd_logind_t;
+		type systemd_logind_inhibit_runtime_t;
+	}
+	allow rtkit_daemon_t systemd_logind_t:dbus send_msg;
+	allow systemd_logind_t rtkit_daemon_t:dbus send_msg;
+	allow rtkit_daemon_t systemd_logind_t:fd use;
+	allow rtkit_daemon_t systemd_logind_inhibit_runtime_t:fifo_file write;
+}
+
+# udev:
+# - elogind's uaccess, which gives the user at the seat the sound, video
+#   and input devices, reads the seat in /run/systemd/seats;
+# - a rule gives the backlight's brightness file in /sys to a group;
+# - udevd looks at its own namespaces.
+optional {
+	require {
+		type udev_t;
+		type nsfs_t;
+		type sysfs_t;
+		type systemd_sessions_runtime_t;
+	}
+	allow udev_t systemd_sessions_runtime_t:dir search;
+	allow udev_t systemd_sessions_runtime_t:file { getattr open read };
+	allow udev_t sysfs_t:file setattr;
+	allow udev_t nsfs_t:file getattr;
+}
+
+# A FUSE mount by a service that runs as a user (rclone): fusermount3 gets
+# the descriptor of /dev/fuse back to the service over a socket the
+# service made, and wants the user to be able to write to the mount point,
+# a directory in the home.
+optional {
+	require {
+		type mount_t;
+		type user_home_t;
+	}
+	allow mount_t initrc_t:unix_stream_socket { getattr read write };
+	allow mount_t user_home_t:dir write;
+}
+
+# A tmpfs from fstab on Portage's build directory.
+optional {
+	require {
+		type mount_t;
+		type portage_tmp_t;
+	}
+	allow mount_t portage_tmp_t:dir mounton;
+}
+
+# startx writes the server's key to a file it made in /tmp, with xauth,
+# and removes the file at the end. The policy lets xauth read it.
+optional {
+	require {
+		type xauth_t;
+		type user_tmp_t;
+	}
+	allow xauth_t user_tmp_t:file { unlink write };
+}
+
+# emerge from a terminal: the build has the terminal of the shell that
+# started emerge for its input.
+optional {
+	require {
+		type portage_sandbox_t;
+		type unconfined_t;
+	}
+	allow portage_sandbox_t unconfined_t:fd use;
+}
+
+# emerge binds a socket to ::1 to see whether the machine has IPv6, for
+# the loopback of the build's own network namespace.
+optional {
+	require {
+		type portage_t;
+		type node_t;
+	}
+	allow portage_t node_t:tcp_socket node_bind;
+	allow portage_t node_t:udp_socket node_bind;
+}
+
+# The kernel's install: emerge --config sys-kernel/asahi-kernel, and the
+# same installkernel at the end of every emerge of a kernel. It runs in
+# emerge's own domain, and so does dracut, which the policy takes into a
+# domain of its own only from sysadm_t:
+# - dracut-install reads the module index and the modules through libkmod,
+#   which maps them;
+# - dracut makes /dev/null, /dev/kmsg, /dev/console, /dev/random and
+#   /dev/urandom in the initramfs it puts together in Portage's build
+#   directory, hard-links the tree, and removes it at the end;
+# - it looks at the partition of the root filesystem, and asks btrfs for
+#   the other devices of that filesystem; btrfs opens each one for its
+#   size. Reading a disk is what the policy keeps from all but a few
+#   domains (a neverallow), and it would read past every label: refused,
+#   btrfs names the device all the same, and dracut has the partition from
+#   /sys already;
+# - the eclass asks whether the ESP is a mount point.
+# depmod, which dracut runs for the modules of the initramfs, is in
+# kmod_t, which the policy lets write the modules' index only in
+# /lib/modules: here it writes it in the build directory, and writes to
+# emerge's terminal.
+optional {
+	require {
+		type portage_t;
+		type portage_tmp_t;
+		type portage_devpts_t;
+		type kmod_t;
+		type modules_dep_t;
+		type modules_object_t;
+		type fixed_disk_device_t;
+		type dosfs_t;
+		class blk_file { getattr ioctl open read };
+		class chr_file { create getattr setattr unlink };
+		class dir { add_name remove_name };
+		class file { create map rename };
+		class lnk_file read;
+	}
+	allow portage_t { modules_dep_t modules_object_t }:file map;
+	allow portage_t portage_tmp_t:chr_file { create getattr setattr unlink };
+	allow portage_t fixed_disk_device_t:blk_file getattr;
+	dontaudit portage_t fixed_disk_device_t:blk_file { ioctl open read };
+	allow portage_t dosfs_t:filesystem getattr;
+	allow kmod_t portage_tmp_t:dir { add_name getattr open read remove_name search write };
+	allow kmod_t portage_tmp_t:file { create getattr map open read rename unlink write };
+	allow kmod_t portage_tmp_t:lnk_file read;
+	allow kmod_t portage_devpts_t:chr_file { read write };
+}
+
+# emerge runs gcc-config -c for the compiler's version, and that reads
+# something whose mode leaves root out (the log does not say what). The
+# kernel asks for CAP_DAC_READ_SEARCH first, and for CAP_DAC_OVERRIDE,
+# which the policy gives gcc-config, only when that is refused: it works
+# without, and logs a line each time.
+optional {
+	require {
+		type gcc_config_t;
+		class capability dac_read_search;
+	}
+	allow gcc_config_t self:capability dac_read_search;
+}
+
+# semodule and semanage ask every mounted filesystem how much room it has,
+# and for their own scheduling.
+optional {
+	require {
+		type semanage_t;
+		attribute filesystem_type;
+	}
+	allow semanage_t filesystem_type:filesystem getattr;
+	allow semanage_t self:process getsched;
+}
+
+optional {
+	require {
+		type hwclock_t;
+		type proc_t;
+	}
+	allow hwclock_t proc_t:filesystem getattr;
+}
+
+# NetworkManager may use BPF (CAP_BPF), and the kernel asks for more
+# while it does: CAP_PERFMON, and CAP_SYS_ADMIN when that is refused. It
+# has neither and works: enforcing, it started, connected and came back
+# from sleep. Six lines in the log each time it starts.
+optional {
+	require {
+		type NetworkManager_t;
+	}
+	dontaudit NetworkManager_t self:capability2 perfmon;
+	dontaudit NetworkManager_t self:capability sys_admin;
+}
+
+# semodule and semanage give the files of the policy they have built the
+# user system_u. The policy lets a few domains change the user of a file,
+# and theirs is not one: the files keep the user of who ran the command
+# and the right type, and the policy loads. 312 lines in the log each time.
+optional {
+	require {
+		type semanage_t;
+		type semanage_store_t;
+		type file_context_t;
+		type policy_config_t;
+		type selinux_config_t;
+	}
+	dontaudit semanage_t { semanage_store_t file_context_t policy_config_t selinux_config_t }:file { relabelfrom relabelto };
+	dontaudit semanage_t semanage_store_t:dir { relabelfrom relabelto };
+}

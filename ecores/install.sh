@@ -70,6 +70,9 @@ install)
 	# From here first: where it cannot work, nothing is installed.
 	sh "$here/ecores.sh" start
 	install -D -m 755 "$here/ecores.sh" "$tool"
+	# With SELinux udev runs it only as a program: the file context is
+	# selinux/install.sh policy's, and a new file has its directory's type.
+	! command -v restorecon >/dev/null 2>&1 || restorecon -F "$tool" 2>/dev/null || :
 	echo "installed $tool"
 	install -D -m 755 "$here/ecores.start" "$start"
 	echo "installed $start"
