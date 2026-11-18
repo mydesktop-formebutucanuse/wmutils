@@ -3,7 +3,7 @@
 # OpenRC and the types selinux/install.sh s6 borrows do not allow. Built and
 # loaded by selinux/install.sh policy. Each rule is for a denial in the
 # kernel log of a permissive boot. See selinux/README.md.
-module wmutils_s6 1.5;
+module wmutils_s6 1.6;
 
 require {
 	type init_t;
@@ -183,6 +183,66 @@ optional {
 	}
 	allow portage_t node_t:tcp_socket node_bind;
 	allow portage_t node_t:udp_socket node_bind;
+}
+
+# The kernel's install: emerge --config sys-kernel/asahi-kernel, and the
+# same installkernel at the end of every emerge of a kernel. It runs in
+# emerge's own domain, and so does dracut, which the policy takes into a
+# domain of its own only from sysadm_t:
+# - dracut-install reads the module index and the modules through libkmod,
+#   which maps them;
+# - dracut makes /dev/null, /dev/kmsg, /dev/console, /dev/random and
+#   /dev/urandom in the initramfs it puts together in Portage's build
+#   directory, hard-links the tree, and removes it at the end;
+# - it looks at the partition of the root filesystem, and asks btrfs for
+#   the other devices of that filesystem; btrfs opens each one for its
+#   size. Reading a disk is what the policy keeps from all but a few
+#   domains (a neverallow), and it would read past every label: refused,
+#   btrfs names the device all the same, and dracut has the partition from
+#   /sys already;
+# - the eclass asks whether the ESP is a mount point.
+# depmod, which dracut runs for the modules of the initramfs, is in
+# kmod_t, which the policy lets write the modules' index only in
+# /lib/modules: here it writes it in the build directory, and writes to
+# emerge's terminal.
+optional {
+	require {
+		type portage_t;
+		type portage_tmp_t;
+		type portage_devpts_t;
+		type kmod_t;
+		type modules_dep_t;
+		type modules_object_t;
+		type fixed_disk_device_t;
+		type dosfs_t;
+		class blk_file { getattr ioctl open read };
+		class chr_file { create getattr setattr unlink };
+		class dir { add_name remove_name };
+		class file { create map rename };
+		class lnk_file read;
+	}
+	allow portage_t { modules_dep_t modules_object_t }:file map;
+	allow portage_t portage_tmp_t:chr_file { create getattr setattr unlink };
+	allow portage_t fixed_disk_device_t:blk_file getattr;
+	dontaudit portage_t fixed_disk_device_t:blk_file { ioctl open read };
+	allow portage_t dosfs_t:filesystem getattr;
+	allow kmod_t portage_tmp_t:dir { add_name getattr open read remove_name search write };
+	allow kmod_t portage_tmp_t:file { create getattr map open read rename unlink write };
+	allow kmod_t portage_tmp_t:lnk_file read;
+	allow kmod_t portage_devpts_t:chr_file { read write };
+}
+
+# emerge runs gcc-config -c for the compiler's version, and that reads
+# something whose mode leaves root out (the log does not say what). The
+# kernel asks for CAP_DAC_READ_SEARCH first, and for CAP_DAC_OVERRIDE,
+# which the policy gives gcc-config, only when that is refused: it works
+# without, and logs a line each time.
+optional {
+	require {
+		type gcc_config_t;
+		class capability dac_read_search;
+	}
+	allow gcc_config_t self:capability dac_read_search;
 }
 
 # semodule and semanage ask every mounted filesystem how much room it has,

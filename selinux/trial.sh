@@ -4,13 +4,15 @@
 # and says for each whether it worked and what SELinux refused it (or, in
 # permissive mode, would have refused).
 #
-#   sudo sh selinux/trial.sh [-e] [-t SECONDS] [-o DIR] [TEST...]
+#   sudo sh selinux/trial.sh [-e | -p] [-t SECONDS] [-o DIR] [TEST...]
 #   sh selinux/trial.sh -l        the tests
 #
-# Without -e SELinux stays as it is. With -e the script switches to
+# Without -e or -p SELinux stays as it is. With -e the script switches to
 # enforcing for the tests and back when it ends, however it ends: on a
 # signal, when its terminal goes, and after SECONDS (900) from a process
-# of its own if the script itself is stuck.
+# of its own if the script itself is stuck. With -p it switches to
+# permissive for the tests, to see all that enforcing would refuse, and
+# back when it ends (not after SECONDS: permissive is the way back).
 #
 # The report and the kernel's lines go to DIR (./selinux-trial-DATE).
 # See selinux/README.md.
@@ -20,6 +22,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 all='clients power udev services wifi bluetooth sound vt semodule emerge suspend'
 # Only when named: it writes the kernel image the machine boots from.
 optional='kernel'
+esp=/boot/efi
 services='chronyd bluetoothd metalog rclone getty-tty2 NetworkManager'
 enforce=/sys/fs/selinux/enforce
 
@@ -42,7 +45,8 @@ semodule   the policy built and loaded again
 emerge     a small package built and merged, in each of Portage's build directories
 suspend    to sleep through elogind; a key wakes the machine
 manual     (with -e, at a terminal) sudo and a login on another console, by hand
-kernel     (only when named, never with -e) emerge --config sys-kernel/asahi-kernel
+kernel     (only when named) emerge --config sys-kernel/asahi-kernel: the
+           initramfs, the UKI, BOOTAA64.EFI and m1n1's boot.bin on the ESP
 EOF
 }
 
@@ -350,8 +354,46 @@ EOF
 	esac
 }
 
+# What the kernel's install writes on the ESP: the UKIs, the copy U-Boot
+# boots, m1n1's stage 2.
+esp_files() {
+	ls -l --time-style=+%F_%T "$esp"/EFI/Linux/*.efi "$esp/EFI/BOOT/BOOTAA64.EFI" \
+		"$esp/m1n1/boot.bin" 2>&1
+	sha256sum "$esp/EFI/BOOT/BOOTAA64.EFI" "$esp/m1n1/boot.bin" 2>&1
+}
+
+# Every file the install writes on the ESP is written beside the old one
+# and renamed over it (installkernel keeps the old UKI as *-old.efi, the
+# hooks write *.new and mv), so a step SELinux refuses leaves the old
+# image: enforcing, the test may run.
 t_kernel() {
-	timeout 1800 emerge --config sys-kernel/asahi-kernel </dev/null
+	if pgrep -f 'python-exec/[^ ]*/emerge ' >/dev/null; then
+		echo "another emerge is running"
+		return 77
+	fi
+	ver=$(uname -r)
+	echo "--- modules in /lib/modules/$ver/updates (the initramfs takes those it needs):"
+	ls -l "/lib/modules/$ver/updates" 2>&1
+	echo "--- the ESP before"
+	esp_files
+	echo "--- emerge --config sys-kernel/asahi-kernel"
+	timeout 1800 emerge --config sys-kernel/asahi-kernel </dev/null >"$out/.kernel" 2>&1
+	st=$?
+	cat "$out/.kernel"
+	echo "--- the ESP after"
+	esp_files
+	# The last reason is the one that matters most.
+	why=
+	grep -q 'm1n1 updated at ' "$out/.kernel" || why="update-m1n1 did not finish"
+	grep -q '95-uki-to-bootaa64: .* <- ' "$out/.kernel" || why="95-uki-to-bootaa64 did not copy the UKI"
+	[ "$st" = 0 ] || why="emerge --config ended with $st"
+	if [ "$e" = yes ] && [ "$(cat "$enforce")" != 1 ]; then
+		why="SELinux was permissive by the end (the -t limit?): not a trial under enforcing"
+	fi
+	rm -f "$out/.kernel"
+	[ -n "$why" ] || return 0
+	echo "$why"
+	return 1
 }
 
 # --- running them -----------------------------------------------------
@@ -382,7 +424,7 @@ cleanup() {
 report() {
 	denials >"$out/denials.txt"
 	{
-		echo "SELinux trial, $(date '+%Y-%m-%d %H:%M:%S'), $(if [ "$e" = yes ]; then echo enforcing; else echo "as it was ($(mode_name "$mode0"))"; fi)"
+		echo "SELinux trial, $(date '+%Y-%m-%d %H:%M:%S'), $(if [ "$e" = yes ]; then echo enforcing; elif [ "$p" = yes ]; then echo permissive; else echo "as it was ($(mode_name "$mode0"))"; fi)"
 		echo
 		printf '%-10s %-6s %7s %8s\n' test result seconds denials
 		while read -r name res secs; do
@@ -438,20 +480,22 @@ run() {
 }
 
 main() {
-	e=no limit=900 out=
-	while getopts elt:o: o; do
+	e=no p=no limit=900 out=
+	while getopts eplt:o: o; do
 		case $o in
 		e) e=yes ;;
+		p) p=yes ;;
 		l)
 			describe
 			exit 0
 			;;
 		t) limit=$OPTARG ;;
 		o) out=$OPTARG ;;
-		*) die "usage: $0 [-e] [-t SECONDS] [-o DIR] [TEST...]" ;;
+		*) die "usage: $0 [-e | -p] [-t SECONDS] [-o DIR] [TEST...]" ;;
 		esac
 	done
 	shift $((OPTIND - 1))
+	[ "$e" = no ] || [ "$p" = no ] || die "-e or -p, not both"
 	[ "$(id -u)" -eq 0 ] || die "Run as root: sudo sh $0"
 	[ -e "$enforce" ] || die "SELinux is not on (no $enforce)."
 	[ "$limit" -gt 0 ] 2>/dev/null || die "-t wants seconds"
@@ -461,9 +505,6 @@ main() {
 		*" $t "*) ;;
 		*) die "no test '$t': sh $0 -l" ;;
 		esac
-		if [ "$t" = kernel ] && [ "$e" = yes ]; then
-			die "kernel is not for -e: a kernel image half written is a machine that does not boot."
-		fi
 	done
 	if [ "$e" = yes ] && [ $# -eq 0 ]; then
 		tests="$tests manual"
@@ -516,6 +557,9 @@ main() {
 		watchdog=$!
 		echo 1 >"$enforce" || die "Could not switch to enforcing."
 		echo "SELinux is enforcing for the tests, and for $limit seconds at most."
+	elif [ "$p" = yes ] && [ "$mode0" != 0 ]; then
+		echo 0 >"$enforce" || die "Could not switch to permissive."
+		echo "SELinux is permissive for the tests, and $(mode_name "$mode0") again when they end."
 	else
 		echo "SELinux is $(mode_name "$mode0") and stays so."
 	fi

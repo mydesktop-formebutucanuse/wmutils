@@ -9,7 +9,7 @@ is a way back (see [What enforcing covers](#what-enforcing-covers)).
 | File | What it is |
 |---|---|
 | [install.sh](install.sh) | The steps: `status`, `profile`, `packages`, `boot`, `relabel`, `s6`, `policy`, `denials`, `enforcing`, their `-undo`, `remove` |
-| [trial.sh](trial.sh) | Does what the machine does every day, one thing after another, and says what SELinux refused each; with `-e`, enforcing for as long as it runs |
+| [trial.sh](trial.sh) | Does what the machine does every day, one thing after another, and says what SELinux refused each; with `-e`, enforcing for as long as it runs, with `-p` permissive |
 | [make.defaults](make.defaults) | For the Portage profile: one policy store, `mcs` |
 | [dracut.conf](dracut.conf) | Has the initramfs load the policy |
 | [selinuxfs.start](selinuxfs.start) | Mounts selinuxfs at every boot, from `/etc/local.d` |
@@ -37,6 +37,11 @@ to 12, nine of them from before the switch of step 9.
 [trial.sh](trial.sh): everything it does worked. **Step 9, enforcing at
 boot, ran after that**, and the machine has booted enforcing once.
 
+**The kernel's install** (`emerge --config sys-kernel/asahi-kernel`)
+failed enforcing on 2026-11-18, before it wrote anything to the ESP.
+Module 1.6 is for it, and with 1.6 it ran through enforcing the same
+evening: the initramfs, the UKI, `BOOTAA64.EFI` and m1n1's `boot.bin`
+(see [the trial](#trying-it-sudo-sh-selinuxtrialsh)).
 
 ## How it was
 
@@ -465,15 +470,26 @@ kernel's limits off, and writes its own lines there to tell which test a
 denial fell into. The report is a table of the tests (worked or not,
 denials) and the summary `denials` gives, in a directory of its own.
 
-Without `-e` SELinux stays as it is: permissive, the policy is loaded
-again before each test so the kernel logs everything anew. With `-e` the
-script switches to enforcing for the tests and back at its end, on a
-signal and when its terminal goes; a process of its own switches back
-after 900 seconds (`-t`) if the script cannot. At the end it waits for
-the two things it cannot do: `sudo` with the password, and a login on
-another console. `kernel`, which is `emerge --config
-sys-kernel/asahi-kernel`, runs only when named and never with `-e`: a
-kernel image half written is a machine that does not boot.
+Without `-e` or `-p` SELinux stays as it is: permissive, the policy is
+loaded again before each test so the kernel logs everything anew. With
+`-p` the script switches to permissive for the tests, to see all that
+enforcing would refuse on a machine that boots enforcing, and back at its
+end. With `-e` it switches to enforcing for the tests and back at its
+end, on a signal and when its terminal goes; a process of its own
+switches back after 900 seconds (`-t`) if the script cannot. At the end
+it waits for the two things it cannot do: `sudo` with the password, and
+a login on another console.
+
+`kernel`, which is `emerge --config sys-kernel/asahi-kernel`, runs only
+when named. It lists the modules in `/lib/modules/<version>/updates`
+(the initramfs takes those it needs from there before the kernel's own),
+the files on the ESP with their checksums before and after, and has
+worked only if emerge ended well and both hooks that write to the ESP,
+`95-uki-to-bootaa64` and `update-m1n1`, said they had. It may run with
+`-e`: installkernel and both hooks write each file beside the old one
+and rename it over, so a step that is refused leaves the image that was
+there. Each run makes the UKI it finds `*-old.efi` and removes the one
+before: two runs in a row leave no image on the ESP that has booted.
 
 It ran on the machine on 2026-11-16, permissive, with module 1.3: every
 test worked, `emerge` in a run of its own after another emerge had
@@ -488,6 +504,37 @@ for `CAP_SYS_ADMIN` (six lines each time it starts), and `semodule`
 giving the files of the policy it built the user `system_u` (312 lines
 each time): the files keep the user of who ran the command, and the
 policy loads.
+
+The kernel's install was not among them, and on 2026-11-18, enforcing
+with 1.5, it failed in dracut, before the UKI: `mknod` of the initramfs's
+`/dev` nodes, `mmap` of `modules.dep.bin` and of the modules, and
+`depmod`, all refused. installkernel runs the hooks in emerge's own
+domain, `portage_t`, and so dracut too; the policy takes dracut into its
+own domain only from `sysadm_t`. `portage_t` may write nearly any file,
+but not map the modules or make a device node, and `depmod` (`kmod_t`)
+may write the modules' index only in `/lib/modules`, not in Portage's
+build directory where dracut puts the initramfs together.
+
+`trial.sh -p kernel` with 1.5 then had the whole list: 70 lines of 27
+kinds, all from the install, which went through in 11 seconds. Module 1.6
+allows them, but one: btrfs, which dracut asks for the devices of the
+root filesystem, opens the partition for its size. Reading a disk is
+what a neverallow of the policy keeps from all but a few domains (it
+reads past every label, `/etc/shadow`'s too), so 1.6 has the kernel
+refuse it without a line in the log. btrfs names the partition all the
+same, and dracut has it from `/sys` already. 1.6 was tried without root
+first: linked, expanded (which checks the neverallows), and `sesearch`
+for each of the 29 permissions: 26 allowed, the three of btrfs not and
+not logged; with 1.5 all 29 refused.
+
+With 1.6 loaded, `trial.sh -e kernel`: worked enforcing in 10 seconds,
+nothing refused, the new UKI in `EFI/Linux` and as `BOOTAA64.EFI`, the
+one before as `*-old.efi`, and `boot.bin` written. What dracut, ukify and
+the hooks printed was the same as in the permissive run, but for the
+free room on the ESP. Not tried when written: a boot of that UKI, and
+`emerge sys-kernel/asahi-kernel` itself. Its end, `pkg_postinst`, runs the
+same installkernel as `--config`; the build before it, in
+`portage_sandbox_t`, has been tried only with a small package.
 
 ### 9. `sudo sh selinux/install.sh enforcing`
 
