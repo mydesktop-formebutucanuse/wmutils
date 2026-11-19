@@ -110,6 +110,33 @@ takes about 60 a second.
   and once more 1.5 s later.
 - **Panel off.** When the internal panel's DPMS is not `On`, the keyboard is
   switched off, ramps stop, and only DPMS is checked, once a second.
+- **Sleep.** A closing lid darkens the sensor a second or two before the
+  machine sleeps (the lid switch starts the sleep; about 1 s more until it
+  is asleep, measured on an M1 Pro). Left alone, that starts dimming the
+  screen, and it ends a manual setting, because the light "changed a lot".
+  So a change the light caused counts only once it has stood for 5 s
+  without a sleep. On waking, both backlights go back at once, without a
+  ramp, to how they were set 5 s before the sleep: the same brightness, and
+  still set by hand if they were. For the next 3 s the light changes
+  nothing (the lid is still opening); after that it counts again, read
+  afresh. Whatever the brightness file holds after the sleep is not taken
+  for a manual change. A brightness key pressed just before the sleep
+  counts, like every manual change. The sleep is noticed from the clocks,
+  with no hook in the sleep path and no D-Bus: `CLOCK_BOOTTIME` counts the
+  time asleep and `CLOCK_MONOTONIC` does not, so the difference grows by
+  each sleep.
+- **Restart.** What the backlights are set to (the value, and whether it
+  was set by hand and at what light) is saved in
+  `$XDG_STATE_HOME/autobrightd/state` (`~/.local/state/autobrightd/state`)
+  whenever it changes, by the same rule: manual changes at once (after the
+  key is let go), changes by the light after 5 s. At startup both
+  backlights are set to it at once, so a restart of the machine or of the
+  daemon comes back with the brightness it had: a manual setting stays
+  manual until the light changes a lot, and an automatic one goes on from
+  there. Until the daemon starts with the session, the screen has the
+  brightness the firmware gave it. A value saved for another
+  `max_brightness` (other kernel patches) is ignored. `-n` reads the file
+  but does not write it.
 
 ## Requirements
 

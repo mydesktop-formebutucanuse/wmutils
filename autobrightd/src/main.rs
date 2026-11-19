@@ -7,6 +7,10 @@
 //! 200 ms), and about 60 times a second while a change runs. Manual
 //! screen changes are noticed through sysfs_notify() on actual_brightness,
 //! and plugging or unplugging the charger through kernel uevents.
+//!
+//! What the backlights were set to is saved (state.rs) and put back when
+//! the daemon starts, so it survives a restart of the machine, and put back
+//! after a sleep, whatever the closing lid did to the light.
 
 /// eprintln! that ignores errors. With panic = "abort", a closed or broken
 /// stderr (say, the terminal that started the session is gone) would
@@ -20,9 +24,10 @@ macro_rules! say {
 
 mod calibrate;
 mod logic;
+mod state;
 mod sys;
 
-use logic::{Channel, LuxFilter, Settings, Update};
+use logic::{Channel, Kept, LuxFilter, Settings, Update};
 use std::path::Path;
 use std::process::exit;
 use std::rc::Rc;
@@ -48,6 +53,9 @@ const POWER_POLL: Duration = Duration::from_secs(5);
 const SAMPLE: Duration = Duration::from_millis(200);
 /// While the panel is off, only DPMS is checked, this often.
 const DPMS_OFF_CHECK: Duration = Duration::from_secs(1);
+/// The time asleep (sys::time_asleep) growing by this much is a sleep. It
+/// only ever grows by whole sleeps, which take seconds.
+const SLEEP_MIN: Duration = Duration::from_millis(500);
 
 const USAGE: &str = "usage: autobrightd [-v] [-n] | --calibrate
   -v           print what it does
@@ -79,6 +87,30 @@ struct Daemon {
     lux: f32,
     on_ac: bool,
     panel_off: bool,
+    /// sys::time_asleep() when last looked at; more means a sleep since.
+    asleep: Duration,
+    /// After a sleep, the light changes nothing until then.
+    hold_until: Option<Instant>,
+    /// What the state file holds (screen, keyboard), if written.
+    saved: Option<(Kept, Option<Kept>)>,
+}
+
+/// Sets a backlight to `to` at once, without a change in steps: after a
+/// restart or a sleep there is nothing on the screen to fade from.
+fn set_now(b: &mut Backlight, to: u32, dry_run: bool) {
+    if to == b.channel.known {
+        return;
+    }
+    if !dry_run && let Err(e) = b.attr.write_u32(to) {
+        say!("autobrightd: writing {}: {e}", b.attr.path.display());
+        b.channel.stop();
+        return;
+    }
+    b.channel.wrote(to);
+}
+
+fn mode(kept: Kept) -> &'static str {
+    if kept.override_lux.is_some() { "set by hand" } else { "automatic" }
 }
 
 fn open_backlight(name: &'static str, dir: &str, settings: Settings, write: bool) -> Result<Backlight, String> {
@@ -134,7 +166,7 @@ impl Daemon {
             let _ = n.read_int();
         }
 
-        let kbd = match max_brightness(KBD_DIR) {
+        let mut kbd = match max_brightness(KBD_DIR) {
             Ok(max) => {
                 let settings = Settings {
                     curve: logic::KBD_CURVE,
@@ -147,6 +179,25 @@ impl Daemon {
             }
             Err(_) => None,
         };
+        // Back to what they were set to when the daemon last ran. A value
+        // for another max_brightness (other kernel patches) is left alone.
+        let saved = state::load().unwrap_or_else(|e| {
+            say!("autobrightd: {e}");
+            Vec::new()
+        });
+        for b in std::iter::once(&mut screen).chain(kbd.as_mut()) {
+            let max = b.channel.settings.max;
+            let entry = saved.iter().find(|e| e.name == b.channel.name && e.max == max && e.kept.target <= max);
+            if let Some(entry) = entry {
+                let from = b.channel.known;
+                let to = b.channel.restore(entry.kept);
+                set_now(b, to, dry_run);
+                if verbose {
+                    say!("autobrightd: {} {from} -> {to} as saved ({})", b.channel.name, mode(entry.kept));
+                }
+            }
+        }
+
         let battery = Attr::open(BATTERY_STATUS, false).ok();
         let uevents = battery.as_ref().and_then(|_| Uevents::open().ok());
         let dpms = sys::find_edp_dpms().and_then(|p| Attr::open(p, false).ok());
@@ -167,6 +218,9 @@ impl Daemon {
             lux: 0.0,
             on_ac: false,
             panel_off: false,
+            asleep: sys::time_asleep(),
+            hold_until: None,
+            saved: None,
         };
         if verbose {
             let path = |a: &Option<Attr>| a.as_ref().map_or("(none)".into(), |a| a.path.display().to_string());
@@ -269,6 +323,11 @@ impl Daemon {
         self.lux = self.filter.update(raw);
         // The LED class sends no change notification, so look each sample.
         self.check(Which::Kbd);
+        // Just woken: the lid is still opening, the sensor in its shadow.
+        if self.hold_until.is_some_and(|t| now < t) {
+            return;
+        }
+        self.hold_until = None;
 
         let lux = self.lux;
         let boost = if self.on_ac { logic::AC_SCREEN_BOOST_PCT } else { 0.0 };
@@ -305,6 +364,62 @@ impl Daemon {
                 k.channel.wrote(0);
                 k.channel.stop();
             }
+            // Nothing by hand is left to go back to after a sleep, either.
+            k.channel.keep();
+        }
+    }
+
+    /// The machine slept. Closing the lid darkened the sensor before that,
+    /// which may have started dimming the screen or ended a manual setting:
+    /// both backlights go back, at once, to how they were set before
+    /// (logic::SLEEP_LEAD), and the light counts again from scratch after
+    /// logic::WAKE_HOLD.
+    fn woke(&mut self, slept: Duration, now: Instant) {
+        self.filter.reset();
+        self.hold_until = Some(now + logic::WAKE_HOLD);
+        // The charger may have been plugged in or pulled while asleep.
+        if self.battery.is_some() {
+            self.power_check = Some(now);
+        }
+        let (dry_run, verbose) = (self.dry_run, self.verbose);
+        if verbose {
+            say!("autobrightd: slept {:.0} s", slept.as_secs_f32());
+        }
+        for b in self.backlights() {
+            // Whatever the file holds now is not a change by hand.
+            let current = if dry_run { b.channel.known } else { b.attr.read_u32().unwrap_or(b.channel.known) };
+            let to = b.channel.woke(current, now);
+            set_now(b, to, dry_run);
+            if verbose {
+                let kept = b.channel.kept(now);
+                say!("autobrightd: {} {current} -> {to} as before the sleep ({})", b.channel.name, mode(kept));
+            }
+        }
+    }
+
+    /// Saves what the backlights are set to, when that has changed, for the
+    /// next start.
+    fn save(&mut self, now: Instant) {
+        // A brightness key that is down moves its target with every frame.
+        let key_down = |b: &mut Backlight| b.channel.ramp.as_ref().is_some_and(|r| r.by_key);
+        if self.dry_run || self.backlights().any(key_down) {
+            return;
+        }
+        let kept = (self.screen.channel.kept(now), self.kbd.as_mut().map(|k| k.channel.kept(now)));
+        if self.saved == Some(kept) {
+            return;
+        }
+        // Even if it fails: say so once, not five times a second.
+        self.saved = Some(kept);
+        let entry = |b: &Backlight, kept| state::Entry {
+            name: b.channel.name.to_owned(),
+            max: b.channel.settings.max,
+            kept,
+        };
+        let mut entries = vec![entry(&self.screen, kept.0)];
+        entries.extend(self.kbd.as_ref().zip(kept.1).map(|(k, kept)| entry(k, kept)));
+        if let Err(e) = state::save(&entries) {
+            say!("autobrightd: {e}");
         }
     }
 
@@ -360,6 +475,12 @@ impl Daemon {
         let mut next_sample = Instant::now();
         loop {
             let now = Instant::now();
+            let asleep = sys::time_asleep();
+            if asleep >= self.asleep + SLEEP_MIN {
+                self.woke(asleep - self.asleep, now);
+                self.asleep = asleep;
+                next_sample = now;
+            }
             let mut deadline = next_sample;
             if !self.panel_off {
                 for b in self.backlights() {
@@ -416,6 +537,7 @@ impl Daemon {
             }
             if now >= next_sample {
                 self.sample(now);
+                self.save(now);
                 next_sample = if self.panel_off {
                     now + DPMS_OFF_CHECK
                 } else if next_sample + SAMPLE > now {
