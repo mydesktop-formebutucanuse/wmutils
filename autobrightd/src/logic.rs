@@ -6,6 +6,7 @@
 //! (Craig Hughes) and juicecultus/asahi-auto-brightness. Their MIT notice,
 //! which has to stay with copies of that work, is in NOTICE.
 
+use std::collections::VecDeque;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -111,6 +112,16 @@ pub const WRITE_GAP: Duration = Duration::from_millis(1);
 pub const LUX_RESUME_PCT: f32 = 75.0;
 /// ... and by at least this many lux, which matters in the dark.
 pub const LUX_RESUME_ABS: f32 = 5.0;
+
+/// What the light does in the last moments before the machine sleeps is
+/// undone on waking: a closing lid darkens the sensor a second or two before
+/// the lid switch starts the sleep (about one more second, measured on an
+/// M1 Pro), which would dim the screen and end a manual setting. So a change
+/// the light caused counts only once it has stood this long without a sleep.
+pub const SLEEP_LEAD: Duration = Duration::from_secs(5);
+/// After waking, the light changes nothing for this long: the lid is still
+/// opening and the sensor is in its shadow.
+pub const WAKE_HOLD: Duration = Duration::from_secs(3);
 
 pub fn interpolate(curve: Curve, lux: f32) -> f32 {
     let (first, last) = (curve[0], curve[curve.len() - 1]);
@@ -347,6 +358,15 @@ impl Ramp {
     }
 }
 
+/// What a channel goes back to after a sleep or a restart.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Kept {
+    /// Where it was heading.
+    pub target: u32,
+    /// Smoothed lux when the user took over; None while automatic.
+    pub override_lux: Option<f32>,
+}
+
 /// One backlight (screen or keyboard).
 pub struct Channel {
     pub name: &'static str,
@@ -362,6 +382,11 @@ pub struct Channel {
     key: Option<KeyHold>,
     /// How the panel follows the written value, if measured.
     pub map: Option<Rc<PanelMap>>,
+    /// What to go back to after a sleep or a restart: the last change by
+    /// the user, or by the light once it is older than SLEEP_LEAD.
+    kept: Kept,
+    /// What the light has done since, oldest first: (when, what it led to).
+    recent: VecDeque<(Instant, Kept)>,
 }
 
 /// A brightness key that is down. The brightness moves on in its direction
@@ -388,7 +413,58 @@ pub enum Update {
 
 impl Channel {
     pub fn new(name: &'static str, settings: Settings, current: u32) -> Channel {
-        Channel { name, settings, known: current, target: current, ramp: None, override_lux: None, key: None, map: None }
+        Channel {
+            name,
+            settings,
+            known: current,
+            target: current,
+            ramp: None,
+            override_lux: None,
+            key: None,
+            map: None,
+            kept: Kept { target: current, override_lux: None },
+            recent: VecDeque::new(),
+        }
+    }
+
+    /// Makes what the channel is set to now what it goes back to. For
+    /// changes by the user, which count at once.
+    pub fn keep(&mut self) {
+        self.kept = Kept { target: self.target, override_lux: self.override_lux };
+        self.recent.clear();
+    }
+
+    /// What to go back to if the machine went to sleep at `now`.
+    pub fn kept(&mut self, now: Instant) -> Kept {
+        while let Some(&(at, state)) = self.recent.front() {
+            if now.saturating_duration_since(at) < SLEEP_LEAD {
+                break;
+            }
+            self.kept = state;
+            self.recent.pop_front();
+        }
+        self.kept
+    }
+
+    /// Goes back to `kept` (from before a restart). Returns the value to
+    /// write, at once: nobody watches a restart or a wakeup fade.
+    pub fn restore(&mut self, kept: Kept) -> u32 {
+        self.ramp = None;
+        self.key = None;
+        self.recent.clear();
+        self.kept = kept;
+        self.target = kept.target;
+        self.override_lux = kept.override_lux;
+        kept.target
+    }
+
+    /// The machine slept and the brightness file now holds `current`. Goes
+    /// back to how the channel was set SLEEP_LEAD before the sleep, and
+    /// returns the value to write.
+    pub fn woke(&mut self, current: u32, now: Instant) -> u32 {
+        self.known = current;
+        let kept = self.kept(now);
+        self.restore(kept)
     }
 
     /// A value read back from the brightness file. Returns true when someone
@@ -401,6 +477,7 @@ impl Channel {
         self.known = value;
         self.stop();
         self.override_lux = Some(lux);
+        self.keep();
         true
     }
 
@@ -418,6 +495,10 @@ impl Channel {
         if worth_moving(self.target, want, self.settings.max) {
             self.head_for(want, now);
             result = Update::Moving(want);
+        }
+        if result != Update::Nothing {
+            let state = Kept { target: self.target, override_lux: self.override_lux };
+            self.recent.push_back((now, state));
         }
         result
     }
@@ -506,6 +587,7 @@ impl Channel {
         self.target = to;
         self.override_lux = Some(lux);
         self.key = Some(KeyHold { dir, min_to: want, last: now });
+        self.keep();
         let (s, map) = (&self.settings, &self.map);
         let ramp = self.ramp.get_or_insert_with(|| Ramp::new(self.known, to, s, KEY_MOTION, map.clone(), now));
         ramp.to = to;
@@ -524,6 +606,7 @@ impl Channel {
         let x = if (stop - hold.min_to) * hold.dir >= 0.0 { stop } else { hold.min_to };
         ramp.head_for(x.clamp(lo, hi));
         self.target = ramp.to;
+        self.keep();
     }
 
     /// While a key is down, keeps the target just far enough ahead that the
@@ -545,6 +628,7 @@ impl Channel {
         let x = if (ahead - min_to) * dir >= 0.0 { ahead } else { min_to };
         ramp.head_for(x.clamp(lo, hi));
         self.target = ramp.to;
+        self.keep();
     }
 
     /// Records a successful write of `value`. Read the file back afterwards
@@ -1113,6 +1197,100 @@ mod tests {
         assert_eq!(ch.update(180.0, 0.0, t), Update::Moving(nits(280)));
         assert_eq!(ch.override_lux, None);
         assert_eq!(run(&mut ch, t, SCREEN_WRITE).last().unwrap().1, nits(280));
+    }
+
+    #[test]
+    fn a_closing_lid_does_not_end_a_manual_setting() {
+        // Set to 200 nits by hand at 100 lux. The lid closes: the sensor
+        // goes dark, automatic control comes back and starts dimming. The
+        // machine sleeps 1.5 s later.
+        let t = Instant::now();
+        let mut ch = screen(nits(300));
+        assert!(ch.observe(nits(200), 100.0));
+        let closing = t + Duration::from_secs(60);
+        assert_eq!(ch.update(1.0, 0.0, closing), Update::Moving(nits(130)));
+        let asleep = closing + Duration::from_millis(1500);
+        let dimmed = run_until(&mut ch, closing, asleep).last().unwrap().1;
+        assert!(dimmed < nits(200), "{dimmed}");
+        // Waking: back to 200 nits at once, and still set by hand.
+        assert_eq!(ch.woke(dimmed, asleep), nits(200));
+        assert!(ch.ramp.is_none());
+        assert_eq!((ch.target, ch.override_lux), (nits(200), Some(100.0)));
+        ch.wrote(nits(200));
+        // The same light as before the sleep changes nothing ...
+        assert_eq!(ch.update(100.0, 0.0, asleep + WAKE_HOLD), Update::Nothing);
+        // ... and a different one still brings automatic control back.
+        assert_eq!(ch.update(180.0, 0.0, asleep + WAKE_HOLD), Update::Moving(nits(280)));
+    }
+
+    #[test]
+    fn a_closing_lid_does_not_dim_an_automatic_screen() {
+        let t = Instant::now();
+        let mut ch = screen(nits(125));
+        // 300 lux: 350 nits, and it has been there for a minute.
+        assert_eq!(ch.update(300.0, 0.0, t), Update::Moving(nits(350)));
+        run(&mut ch, t, SCREEN_WRITE);
+        let closing = t + Duration::from_secs(60);
+        assert_eq!(ch.update(0.0, 0.0, closing), Update::Moving(nits(125)));
+        let asleep = closing + Duration::from_secs(2);
+        let dimmed = run_until(&mut ch, closing, asleep).last().unwrap().1;
+        assert!(dimmed < nits(350));
+        assert_eq!(ch.woke(dimmed, asleep), nits(350));
+        assert_eq!(ch.override_lux, None);
+        ch.wrote(nits(350));
+        // Still automatic: woken in a darker room, it goes there.
+        assert_eq!(ch.update(100.0, 0.0, asleep + WAKE_HOLD), Update::Moving(nits(200)));
+    }
+
+    #[test]
+    fn what_the_light_did_long_before_a_sleep_stays() {
+        let t = Instant::now();
+        let mut ch = screen(nits(300));
+        assert!(ch.observe(nits(200), 100.0));
+        // The light goes out; the machine is put to sleep after SLEEP_LEAD.
+        assert_eq!(ch.update(1.0, 0.0, t), Update::Moving(nits(130)));
+        run(&mut ch, t, SCREEN_WRITE);
+        assert_eq!(ch.woke(nits(130), t + SLEEP_LEAD), nits(130));
+        assert_eq!(ch.override_lux, None);
+    }
+
+    #[test]
+    fn a_key_pressed_just_before_a_sleep_counts() {
+        let t = Instant::now();
+        let mut ch = screen(nits(300));
+        let to = ch.key_step(-1, 100.0, t);
+        ch.key_release();
+        run(&mut ch, t, SCREEN_WRITE);
+        assert!(to < nits(300));
+        // The lid closes right after: the key's brightness is what comes back.
+        let closing = t + Duration::from_secs(1);
+        assert!(matches!(ch.update(1.0, 0.0, closing), Update::Moving(_)));
+        assert_eq!(ch.woke(to, closing + Duration::from_secs(1)), to);
+        assert_eq!(ch.override_lux, Some(100.0));
+    }
+
+    #[test]
+    fn a_restart_goes_back_to_what_was_saved() {
+        // Started at the brightness the firmware left, 250 nits; 34 nits
+        // set by hand were saved.
+        let mut ch = screen(nits(250));
+        let saved = Kept { target: nits(34), override_lux: Some(3.0) };
+        assert_eq!(ch.restore(saved), nits(34));
+        ch.wrote(nits(34));
+        let t = Instant::now();
+        assert_eq!(ch.kept(t), saved);
+        assert_eq!(ch.update(4.0, 0.0, t), Update::Nothing);
+        assert!(ch.ramp.is_none());
+    }
+
+    #[test]
+    fn what_is_kept_follows_the_light_after_the_lead() {
+        let t = Instant::now();
+        let mut ch = screen(nits(125));
+        assert_eq!(ch.update(300.0, 0.0, t), Update::Moving(nits(350)));
+        let before = Kept { target: nits(125), override_lux: None };
+        assert_eq!(ch.kept(t + SLEEP_LEAD - Duration::from_millis(1)), before);
+        assert_eq!(ch.kept(t + SLEEP_LEAD), Kept { target: nits(350), override_lux: None });
     }
 
     #[test]

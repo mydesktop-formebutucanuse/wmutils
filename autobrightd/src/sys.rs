@@ -106,6 +106,15 @@ const SIGUSR1: c_int = 10;
 const SIGUSR2: c_int = 12;
 const O_NONBLOCK: c_int = 0o4000;
 const O_CLOEXEC: c_int = 0o2000000;
+const CLOCK_MONOTONIC: c_int = 1;
+const CLOCK_BOOTTIME: c_int = 7;
+
+/// struct timespec on 64-bit Linux, where time_t and long are 64 bits.
+#[repr(C)]
+struct Timespec {
+    sec: i64,
+    nsec: i64,
+}
 
 unsafe extern "C" {
     fn poll(fds: *mut PollFd, nfds: c_ulong, timeout: c_int) -> c_int;
@@ -117,6 +126,22 @@ unsafe extern "C" {
     fn __libc_current_sigrtmin() -> c_int;
     fn write(fd: c_int, buf: *const c_void, n: usize) -> isize;
     fn read(fd: c_int, buf: *mut c_void, n: usize) -> isize;
+    fn clock_gettime(clock: c_int, ts: *mut Timespec) -> c_int;
+}
+
+/// How long the machine has been asleep (suspended) since it booted.
+/// CLOCK_BOOTTIME counts that time; CLOCK_MONOTONIC, which Instant and
+/// poll() run on, stands still meanwhile. When this grows, the machine has
+/// slept: no hook in the sleep path and no D-Bus are needed to know.
+pub fn time_asleep() -> Duration {
+    let read = |clock| {
+        let mut ts = Timespec { sec: 0, nsec: 0 };
+        // SAFETY: ts is a valid timespec for the call to fill in.
+        unsafe { clock_gettime(clock, &mut ts) };
+        ts.sec * 1_000_000_000 + ts.nsec
+    };
+    let (boot, awake) = (read(CLOCK_BOOTTIME), read(CLOCK_MONOTONIC));
+    Duration::from_nanos((boot - awake).max(0) as u64)
 }
 
 /// Write end of the key pipe, for the signal handler.
