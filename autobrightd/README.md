@@ -57,7 +57,7 @@ takes about 60 a second.
   and nothing overshoots. Each write is the nearest whole value, which needs the
   kernel patch for 1/64 nit to stay smooth; with whole nits the slow parts
   move in 1-nit steps. The keyboard moves much faster (off to
-  75 % in about 2 s): nobody watches it fade.
+  60 % in about 2 s): nobody watches it fade.
 - **Panel map.** The panel does not follow the driver's nits evenly. What
   the DCP reports it shows (`actual_brightness`, whole nits, about 26 ms
   late) rises 1.4 times as fast as the written value just above about 130
