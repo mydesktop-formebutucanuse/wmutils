@@ -27,7 +27,7 @@ pub const SCREEN_CURVE: Curve = &[
 ];
 
 /// The other way round: a bright keyboard in the dark, off in daylight.
-pub const KBD_CURVE: Curve = &[(0.0, 75.0), (5.0, 50.0), (20.0, 25.0), (50.0, 0.0)];
+pub const KBD_CURVE: Curve = &[(0.0, 60.0), (5.0, 40.0), (20.0, 20.0), (50.0, 0.0)];
 
 pub const SCREEN_FLOOR_PCT: f32 = 25.0;
 /// The Apple panel shows everything up to 2 nits the same: the driver gives
@@ -666,7 +666,7 @@ mod tests {
         assert_eq!(interpolate(SCREEN_CURVE, -3.0), 25.0);
         assert_eq!(interpolate(SCREEN_CURVE, 300.0), 70.0);
         assert_eq!(interpolate(SCREEN_CURVE, 5000.0), 100.0);
-        assert_eq!(interpolate(KBD_CURVE, 2.5), 62.5);
+        assert_eq!(interpolate(KBD_CURVE, 2.5), 50.0);
         assert_eq!(interpolate(KBD_CURVE, 400.0), 0.0);
     }
 
@@ -1077,9 +1077,9 @@ mod tests {
             Settings { curve: KBD_CURVE, floor_pct: KBD_FLOOR_PCT, max: 255, motion: KBD_MOTION, dead_zone: 0 },
             0,
         );
-        assert_eq!(kbd.update(0.0, 0.0, t), Update::Moving(191));
+        assert_eq!(kbd.update(0.0, 0.0, t), Update::Moving(153));
         let w = run(&mut kbd, t, Duration::ZERO);
-        assert_eq!(w.last().unwrap().1, 191);
+        assert_eq!(w.last().unwrap().1, 153);
         let last_t = w.last().unwrap().0;
         assert!(last_t > 1.5 && last_t < 3.0, "{last_t}");
         let frame = FRAME.as_secs_f32() - 1e-4;
